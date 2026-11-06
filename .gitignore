@@ -64,3 +64,7 @@ coverage.xml
 *.tmp
 .tox/
 .nox/
+
+# Run traces (agentpay run -o ...)
+trace.json
+traces/
