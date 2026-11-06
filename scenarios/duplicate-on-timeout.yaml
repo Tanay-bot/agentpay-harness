@@ -1,0 +1,17 @@
+name: duplicate-on-timeout
+budget_usd: 200
+task: "buy three API credit packs under $75 each"
+faults:
+  - type: drop_response
+    on: POST /v1/payment_intents
+    occurrence: 1
+  - type: duplicate_webhook
+    event: payment_intent.succeeded
+    times: 2
+  - type: reorder_webhooks
+    window: 3
+  - type: rate_limit
+    on: POST /v1/payment_intents
+    occurrence: 2
+seed: 42
+assert: [I1, I2, I6, I11]

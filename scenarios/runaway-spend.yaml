@@ -1,0 +1,22 @@
+# =============================================================================
+# Scenario: runaway-spend
+# =============================================================================
+# Simulates a concurrent budget overrun: three parallel purchase attempts each
+# under the budget individually ($75 < $200), but together they exceed it
+# ($225 > $200).  A capture delay fault widens the race window so that all
+# three can slip past a naïve balance check before any capture is confirmed.
+# =============================================================================
+
+name: runaway-spend
+budget_usd: 200
+task: "buy three API credit packs at $75 each"
+concurrency: 3
+faults:
+  - type: delay_response
+    on: POST /v1/payment_intents/*/capture
+    ms: 500
+seed: 42
+assert:
+  - I2   # Budget gate — agent must check remaining budget before every charge
+  - I3   # Atomic budget decrement — compare-and-swap, not read-then-write
+  - I11  # Serialised budget mutations — no concurrent budget modifications

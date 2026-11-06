@@ -1,0 +1,33 @@
+# =============================================================================
+# Scenario: webhook-chaos
+# =============================================================================
+# Throws every webhook failure mode at the agent simultaneously:
+#
+#   1. Duplicate delivery — the same payment_intent.succeeded event is
+#      delivered 3 times (Stripe retries on timeout).
+#   2. Reordered events — webhook events within a 5-second window are
+#      shuffled, so the agent might see "succeeded" before "created".
+#   3. Replayed stale event — a payment_intent.created event is replayed
+#      30 seconds after the original, simulating a delayed retry.
+#
+# A correct agent must be idempotent on event IDs, tolerate out-of-order
+# delivery, and reject stale replays.
+# =============================================================================
+
+name: webhook-chaos
+budget_usd: 100
+task: "buy one API credit pack at $50"
+faults:
+  - type: duplicate_webhook
+    event: payment_intent.succeeded
+    times: 3
+  - type: reorder_webhooks
+    window: 5
+  - type: replay_webhook
+    event: payment_intent.created
+    delay_s: 30
+seed: 42
+assert:
+  - I6   # Webhook idempotency — duplicate events must not cause duplicate side-effects
+  - I7   # Event ordering — agent must not assume webhook delivery order
+  - I8   # Stale replay rejection — old events beyond a time window must be discarded
