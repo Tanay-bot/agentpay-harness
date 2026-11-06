@@ -12,6 +12,10 @@ import hashlib
 import hmac
 import time
 
+#: Signing secret the harness uses for every webhook it delivers to the agent.
+#: Agents under test should verify ``StripeEvent.signature_header`` against it.
+HARNESS_WEBHOOK_SECRET = "whsec_test_agentpay_local_secret_42"  # noqa: S105 - test-only secret
+
 
 def compute_signature(payload: str | bytes, secret: str, timestamp: int) -> str:
     """Compute HMAC-SHA256 hex signature for timestamp.payload."""

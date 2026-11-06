@@ -26,6 +26,21 @@ class TimelineEntry:
     event: StripeEvent | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class WebhookDelivery:
+    """One webhook delivery attempt made by the harness to the agent.
+
+    ``signature_valid`` is the harness's own verdict on the delivered signature
+    (wrong secret, or timestamp outside the tolerance window, means False).
+    """
+
+    event_id: str
+    event_type: str
+    signature_valid: bool
+    fault_description: str
+    timestamp: datetime
+
+
 class EventRecorder:
     """Thread-safe store for all :class:`RequestRecord` and :class:`StripeEvent` instances.
 
@@ -36,6 +51,7 @@ class EventRecorder:
     def __init__(self) -> None:
         self._requests: list[RequestRecord] = []
         self._events: list[StripeEvent] = []
+        self._deliveries: list[WebhookDelivery] = []
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -55,6 +71,12 @@ class EventRecorder:
             return list(self._events)
 
     @property
+    def deliveries(self) -> list[WebhookDelivery]:
+        """Return a copy of all webhook delivery attempts."""
+        with self._lock:
+            return list(self._deliveries)
+
+    @property
     def timeline(self) -> list[TimelineEntry]:
         """Return the merged chronological timeline."""
         return self.get_timeline()
@@ -67,6 +89,11 @@ class EventRecorder:
         """Append a request record to the log."""
         with self._lock:
             self._requests.append(record)
+
+    def record_delivery(self, delivery: WebhookDelivery) -> None:
+        """Append a webhook delivery attempt (with its signature verdict)."""
+        with self._lock:
+            self._deliveries.append(delivery)
 
     def record_event(self, event: StripeEvent) -> None:
         """Append a webhook event to the log."""

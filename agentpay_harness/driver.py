@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
+from typing import Any
 from uuid import uuid4
 
 from agentpay_harness.adapters.protocol import AgentUnderTest
@@ -19,6 +22,7 @@ from agentpay_harness.safety import load_stripe_key_from_env, validate_stripe_ke
 from agentpay_harness.stripeio.client import RecordingStripeClient
 from agentpay_harness.stripeio.recorder import EventRecorder
 from agentpay_harness.types import (
+    FaultType,
     Intent,
     PaymentResult,
     PaymentStatus,
@@ -76,50 +80,90 @@ class HarnessDriver:
             force_offline=self.force_offline,
         )
 
-        # Setup webhook delivery system
+        # Webhooks are queued while the agent pays and delivered afterwards,
+        # like Stripe's asynchronous delivery.  Reordering is a queue-level fault.
+        reorder_window = max(
+            (f.window or 3 for f in self.scenario.faults if f.type is FaultType.REORDER_WEBHOOKS),
+            default=0,
+        )
         webhook_delivery = WebhookDeliverySystem(
             target_callback=self.agent.on_event,
             fault_engine=fault_engine,
             recorder=recorder,
+            reorder_window=reorder_window,
+            seed=self.scenario.seed,
         )
+
+        # Logical clock: every event gets a distinct, increasing `created` second.
+        clock_lock = threading.Lock()
+        clock = {"next": int(time.time())}
+
+        def _tick() -> int:
+            with clock_lock:
+                clock["next"] += 1
+                return clock["next"]
+
+        def _event(evt_type: str, pi: dict[str, Any], intent_id: str) -> StripeEvent:
+            return StripeEvent(
+                event_id=f"evt_{uuid4().hex[:16]}",
+                type=evt_type,
+                data={
+                    "object": {
+                        "id": pi["id"],
+                        "object": "payment_intent",
+                        "amount": pi.get("amount"),
+                        "currency": pi.get("currency", "usd"),
+                        "status": pi.get("status"),
+                        "metadata": {"intent_id": intent_id},
+                    }
+                },
+                created=_tick(),
+                livemode=False,
+            )
 
         # 1. Step 1: Agent plans the task
         task = Task(
             description=self.scenario.task,
             budget_cents=self.scenario.budget_cents,
+            metadata={"capture_method": self.scenario.capture_method},
         )
         intents = self.agent.plan(task)
+        if self.scenario.capture_method != "automatic":
+            intents = [replace(i, capture_method=self.scenario.capture_method) for i in intents]
 
         # 2. Step 2: Execute payments (with concurrency if configured)
         payment_results: list[PaymentResult] = []
+        async_settled: list[str] = []
+        pending_async: set[str] = set()
+
+        def client_async_failures() -> set[str]:
+            with clock_lock:
+                pending_async.update(client.take_async_failures())
+                return set(pending_async)
 
         def _execute_intent(intent: Intent) -> PaymentResult:
             res = self.agent.pay(intent, client)
-            # Synthesize and deliver webhook for any created/captured payment intent
-            if res.stripe_payment_intent_id:
-                evt_type = (
-                    "payment_intent.succeeded"
-                    if res.status == PaymentStatus.SUCCEEDED
-                    else "payment_intent.created"
-                )
-                event = StripeEvent(
-                    event_id=f"evt_{uuid4().hex[:16]}",
-                    type=evt_type,
-                    data={
-                        "object": {
-                            "id": res.stripe_payment_intent_id,
-                            "amount": res.amount_cents,
-                            "currency": "usd",
-                            "status": "succeeded"
-                            if res.status == PaymentStatus.SUCCEEDED
-                            else "requires_payment_method",
-                            "metadata": {"intent_id": intent.intent_id},
-                        }
-                    },
-                    created=int(time.time()),
-                    livemode=False,
-                )
-                webhook_delivery.deliver(event)
+            if not res.stripe_payment_intent_id:
+                return res
+            pi_id = res.stripe_payment_intent_id
+            pi = {
+                "id": pi_id,
+                "amount": res.amount_cents,
+                "currency": intent.currency,
+                "status": "requires_payment_method",
+            }
+            webhook_delivery.enqueue(_event("payment_intent.created", pi, intent.intent_id))
+            if res.status == PaymentStatus.SUCCEEDED:
+                pi["status"] = "succeeded"
+                webhook_delivery.enqueue(_event("payment_intent.succeeded", pi, intent.intent_id))
+            elif res.status == PaymentStatus.PROCESSING and pi_id in client_async_failures():
+                # The async payment fails shortly after; Stripe reports it by webhook only.
+                failed = client.settle_async_failure(pi_id)
+                if failed is not None:
+                    async_settled.append(pi_id)
+                    webhook_delivery.enqueue(
+                        _event("payment_intent.payment_failed", failed, intent.intent_id)
+                    )
             return res
 
         if self.scenario.concurrency > 1 and len(intents) > 1:
@@ -135,6 +179,22 @@ class HarnessDriver:
         else:
             for intent in intents:
                 payment_results.append(_execute_intent(intent))
+
+        # 3. Step 3: Deliver webhooks (duplicates, reordering, replays, forgeries)
+        webhook_delivery.flush()
+
+        # 4. Step 4: Optional abort — the agent must release anything still held
+        if self.scenario.abort:
+            abort = getattr(self.agent, "abort", None)
+            if callable(abort):
+                abort(client)
+            else:
+                logger.warning("Scenario requests abort but agent has no abort(client) method")
+
+        # 5. Step 5: Re-read PIs whose state changed asynchronously, so invariants
+        #    compare the agent's ledger against Stripe's final state.
+        for pi_id in async_settled:
+            client.retrieve_payment_intent(pi_id)
 
         # Copy client request records into the EventRecorder
         for req in client.get_records():

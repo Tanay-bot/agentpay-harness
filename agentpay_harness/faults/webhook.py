@@ -7,7 +7,10 @@ simulate real-world Stripe delivery anomalies.
 
 from __future__ import annotations
 
+import copy
 import random
+from dataclasses import replace
+from uuid import uuid4
 
 from agentpay_harness.faults.actions import WebhookAction, WebhookActionType
 from agentpay_harness.types import StripeEvent
@@ -128,5 +131,38 @@ def delay_webhook(event: StripeEvent, ms: int = 5000) -> list[WebhookAction]:
             event=event,
             delay_ms=ms,
             fault_description=f"Delayed delivery by {ms}ms",
+        ),
+    ]
+
+
+def forged_webhook(event: StripeEvent) -> list[WebhookAction]:
+    """Deliver the real event, plus a forged look-alike signed with the wrong secret.
+
+    The forgery claims a *different* PaymentIntent succeeded, so an agent that
+    skips signature verification books money that Stripe never received.
+    """
+    data = copy.deepcopy(event.data)
+    obj = data.setdefault("object", {})
+    obj["id"] = f"pi_forged_{uuid4().hex[:16]}"
+    obj["status"] = "succeeded"
+    obj.setdefault("metadata", {})["intent_id"] = f"forged_{uuid4().hex[:8]}"
+    forged = replace(
+        event,
+        event_id=f"evt_forged_{uuid4().hex[:16]}",
+        type="payment_intent.succeeded",
+        data=data,
+        payload=None,
+        signature_header=None,
+    )
+    return [
+        WebhookAction(
+            action_type=WebhookActionType.DELIVER,
+            event=event,
+            fault_description="Original delivery",
+        ),
+        WebhookAction(
+            action_type=WebhookActionType.FORGE,
+            event=forged,
+            fault_description="Forged event signed with the wrong secret",
         ),
     ]

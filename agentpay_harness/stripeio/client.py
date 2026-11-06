@@ -188,6 +188,41 @@ class _OfflineStripeSimulator:
             pi["_status_code"] = 200
             return 200, copy.deepcopy(pi)
 
+    def mark_processing(self, payment_intent_id: str) -> dict[str, Any] | None:
+        """Turn a just-created PI into an async payment still ``processing``.
+
+        Removes its balance transaction and rewrites the stored idempotent
+        response, so retries see the same ``processing`` state.
+        """
+        with self._lock:
+            pi = self._payment_intents.get(payment_intent_id)
+            if pi is None:
+                return None
+            pi["status"] = "processing"
+            pi["amount_received"] = 0
+            self._balance_transactions = [
+                t for t in self._balance_transactions if t.get("source") != payment_intent_id
+            ]
+            for stored in self._idempotency_store.values():
+                if stored["response"].get("id") == payment_intent_id:
+                    stored["response"] = copy.deepcopy(pi)
+            return copy.deepcopy(pi)
+
+    def fail_async_payment(self, payment_intent_id: str) -> dict[str, Any] | None:
+        """Settle a ``processing`` PI as failed (e.g. the bank debit bounced)."""
+        with self._lock:
+            pi = self._payment_intents.get(payment_intent_id)
+            if pi is None:
+                return None
+            pi["status"] = "requires_payment_method"
+            pi["amount_received"] = 0
+            pi["last_payment_error"] = {
+                "type": "card_error",
+                "code": "payment_failed",
+                "message": "Asynchronous payment failed (fault injection)",
+            }
+            return copy.deepcopy(pi)
+
     def retrieve_payment_intent(self, payment_intent_id: str) -> tuple[int, dict[str, Any]]:
         with self._lock:
             pi = self._payment_intents.get(payment_intent_id)
@@ -240,6 +275,7 @@ class RecordingStripeClient:
         self._records: list[RequestRecord] = []
         self._lock = threading.Lock()
         self._offline_sim = _OfflineStripeSimulator()
+        self._async_failures: list[str] = []
 
         if HAS_STRIPE and not self._force_offline:
             self._stripe_kwargs: dict[str, Any] = {"api_key": api_key}
@@ -432,6 +468,16 @@ class RecordingStripeClient:
         with self._lock:
             return list(self._records)
 
+    def take_async_failures(self) -> list[str]:
+        """Return (and clear) PI ids left ``processing`` by an async-failure fault."""
+        with self._lock:
+            pending, self._async_failures = self._async_failures, []
+        return pending
+
+    def settle_async_failure(self, payment_intent_id: str) -> dict[str, Any] | None:
+        """Fail a ``processing`` PI on the offline backend; returns its new state."""
+        return self._offline_sim.fail_async_payment(payment_intent_id)
+
     # ------------------------------------------------------------------
     # Dispatch & Fault Interception
     # ------------------------------------------------------------------
@@ -564,6 +610,26 @@ class RecordingStripeClient:
 
             if fault.action_type is FaultActionType.DELAY and fault.delay_ms:
                 time.sleep(fault.delay_ms / 1000.0)
+
+            if fault.action_type is FaultActionType.ASYNC_FAILURE:
+                resp = self._call_internal(
+                    method, path, body, headers, idempotency_key, offline_fn, stripe_fn, t0
+                )
+                pi_id = resp.get("id")
+                offline = self._force_offline or not HAS_STRIPE or stripe is None
+                if not offline:
+                    logger.warning("async_payment_failure is only supported offline; ignoring")
+                    return resp
+                if pi_id and resp.get("object") == "payment_intent":
+                    processing = self._offline_sim.mark_processing(str(pi_id))
+                    if processing is not None:
+                        # The record holds this same dict, so it reflects the change too.
+                        resp.clear()
+                        resp.update(processing)
+                        resp["_status_code"] = 200
+                        with self._lock:
+                            self._async_failures.append(str(pi_id))
+                return resp
 
             if fault.action_type is FaultActionType.DUPLICATE:
                 first = self._call_internal(

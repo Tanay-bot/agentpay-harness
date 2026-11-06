@@ -8,7 +8,7 @@ Invariants upheld:
     I5  — Retry uses identical parameters (never mutates amount/currency).
     I6  — Webhook deduplication by event_id.
     I7  — No assumption about webhook delivery order.
-    I8  — Webhook signature verification (placeholder — delegates to caller).
+    I8  — Webhook signature (and timestamp tolerance) verified before processing.
     I9  — On abort, cancel all uncaptured payment intents.
     I10 — Exponential backoff with jitter on 429 (rate-limit) responses.
     I11 — Ledger entries always match Stripe state.
@@ -35,6 +35,7 @@ from agentpay_harness.types import (
     StripeEvent,
     Task,
 )
+from agentpay_harness.webhooks.signatures import HARNESS_WEBHOOK_SECRET, verify_signature
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,8 @@ class ReferenceAgent:
     baseline that every harness scenario should pass against.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, webhook_secret: str = HARNESS_WEBHOOK_SECRET) -> None:
+        self._webhook_secret = webhook_secret
         self._lock = threading.Lock()
         self._ledger: list[LedgerEntry] = []
         self._seen_event_ids: set[str] = set()
@@ -192,6 +194,7 @@ class ReferenceAgent:
                 currency=intent.currency,
                 idempotency_key=idempotency_key,
                 metadata=dict(intent.metadata or {}, intent_id=intent.intent_id),
+                capture_method=intent.capture_method,
             )
         except Exception as exc:
             # Roll back budget reservation on failure.
@@ -220,6 +223,12 @@ class ReferenceAgent:
             with self._lock:
                 self._spent_cents -= intent.amount_cents
                 self._update_ledger_status(intent.intent_id, LedgerEntryStatus.FAILED, stripe_pi_id)
+        elif status_str == "requires_capture":
+            # Authorized but not captured: keep the budget reserved, entry PENDING.
+            with self._lock:
+                self._update_ledger_status(
+                    intent.intent_id, LedgerEntryStatus.PENDING, stripe_pi_id
+                )
         else:
             with self._lock:
                 self._update_ledger_status(
@@ -240,11 +249,19 @@ class ReferenceAgent:
 
         - Deduplicates by event_id (I6).
         - Does not assume ordering (I7).
-        - Checks livemode is False (I8 — basic verification).
+        - Verifies the Stripe-Signature header, including timestamp tolerance (I8).
         """
         # I8 — reject live-mode events.
         if event.livemode:
             logger.warning("Rejecting live-mode event %s", event.event_id)
+            return
+
+        # I8 — reject forged or stale deliveries.  Events injected directly
+        # (no payload/signature, e.g. in unit tests) are trusted.
+        if event.signature_header is not None and not verify_signature(
+            event.payload or b"", event.signature_header, self._webhook_secret
+        ):
+            logger.warning("Rejecting event %s: invalid or stale signature", event.event_id)
             return
 
         # I6 — deduplicate by event_id.
@@ -339,6 +356,7 @@ class ReferenceAgent:
         currency: str,
         idempotency_key: str,
         metadata: dict[str, Any],
+        capture_method: str = "automatic",
     ) -> dict[str, Any]:
         """Call ``create_payment_intent`` with exponential backoff on 429/5xx.
 
@@ -354,6 +372,7 @@ class ReferenceAgent:
                     currency,
                     idempotency_key=idempotency_key,
                     metadata=dict(metadata),  # defensive copy
+                    **({"capture_method": capture_method} if capture_method != "automatic" else {}),
                 )
 
                 # Check for error responses encoded in the result dict.
@@ -382,7 +401,8 @@ class ReferenceAgent:
 
             except _RateLimitError as exc:
                 last_exc = exc
-                delay = exc.retry_after or self._backoff_delay(attempt)
+                # Retry-After is a floor, never a replacement for backoff.
+                delay = max(exc.retry_after or 0.0, self._backoff_delay(attempt))
                 logger.warning(
                     "Rate limited (attempt %d/%d), backing off %.2fs",
                     attempt + 1,
@@ -407,12 +427,13 @@ class ReferenceAgent:
 
     @staticmethod
     def _backoff_delay(attempt: int) -> float:
-        """Calculate exponential backoff with full jitter (I10).
+        """Calculate exponential backoff with "equal jitter" (I10).
 
-        Formula: min(MAX_DELAY, BASE * 2^attempt) * random(0, 1)
+        Formula: cap/2 + random(0, cap/2), where cap = min(MAX_DELAY, BASE * 2^attempt).
+        Half of each delay is guaranteed, so waits never collapse to ~0 by chance.
         """
         cap = min(_MAX_DELAY_S, _BASE_DELAY_S * (2**attempt))
-        return cap * random.random()  # noqa: S311
+        return cap / 2 + (cap / 2) * random.random()  # noqa: S311
 
     @staticmethod
     def _map_stripe_status(status: str) -> PaymentStatus:

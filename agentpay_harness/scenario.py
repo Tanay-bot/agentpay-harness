@@ -38,6 +38,8 @@ FAULT_TYPE_MAP: dict[str, FaultType] = {
     "delay_response": FaultType.DELAY_RESPONSE,
     "delay": FaultType.DELAY_RESPONSE,
     "clock_skew": FaultType.CLOCK_SKEW,
+    "forged_webhook": FaultType.FORGED_WEBHOOK,
+    "async_payment_failure": FaultType.ASYNC_PAYMENT_FAILURE,
 }
 
 
@@ -211,7 +213,16 @@ def parse_scenario_data(raw: dict[str, Any]) -> ScenarioConfig:
         faults=faults,
         assertions=assertions,
         concurrency=concurrency,
+        capture_method=str(raw.get("capture_method", "automatic")).strip().lower(),
+        abort=_parse_bool(raw.get("abort", False)),
     )
+
+
+def _parse_bool(value: Any) -> bool:
+    """Parse a YAML boolean that may arrive as a string from the fallback parser."""
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1", "on")
+    return bool(value)
 
 
 def load_scenario(path: str | Path) -> ScenarioConfig:

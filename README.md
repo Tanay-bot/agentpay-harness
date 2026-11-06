@@ -1,9 +1,5 @@
 # agentpay-harness
 
-<!-- Badges -->
-[![CI](https://img.shields.io/github/actions/workflow/status/agentpay-harness/agentpay-harness/ci.yml?branch=main&label=CI)](https://github.com/agentpay-harness/agentpay-harness/actions)
-[![PyPI](https://img.shields.io/pypi/v/agentpay-harness?color=blue)](https://pypi.org/project/agentpay-harness/)
-[![Python](https://img.shields.io/pypi/pyversions/agentpay-harness)](https://pypi.org/project/agentpay-harness/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 **Fault-injection test harness for AI-agent-initiated Stripe payments.**
@@ -14,122 +10,144 @@ AI agents that spend real money need to be tested against the same failure modes
 
 ## What This Tests
 
-The harness targets **7 failure modes** that commonly afflict AI-agent payment flows:
+The harness targets these failure modes in AI-agent payment flows (details in [docs/FAILURES.md](docs/FAILURES.md)):
 
-| # | Failure Mode | What Goes Wrong |
-|---|---|---|
-| 1 | **Timeout → Duplicate Charge** | Network timeout triggers a retry; agent creates two PaymentIntents for one purchase. |
-| 2 | **Runaway Spend (Race)** | Concurrent purchase attempts each pass a budget check individually, but together exceed the limit. |
-| 3 | **Webhook Duplication** | Stripe retries a webhook; agent processes `payment_intent.succeeded` twice and double-fulfills. |
-| 4 | **Webhook Reordering** | `succeeded` arrives before `created`; agent crashes or creates inconsistent state. |
-| 5 | **Stale Webhook Replay** | An old `payment_intent.created` event is replayed minutes later; agent re-opens a settled flow. |
-| 6 | **Partial Capture Mismatch** | Captured amount differs from the expected amount; agent doesn't notice. |
-| 7 | **Refund Exceeds Capture** | Agent issues a refund larger than the captured amount. |
+| # | Failure Mode | What Goes Wrong | Status |
+|---|---|---|---|
+| F1 | **Timeout → Duplicate Charge** | A dropped response triggers a retry; agent creates two PaymentIntents for one purchase. | `duplicate-on-timeout.yaml` |
+| F2 | **Runaway Spend (Race)** | Concurrent purchases each pass a budget check individually, but together exceed the limit. | `runaway-spend.yaml` |
+| F3 | **Webhook Duplication** | Stripe retries a webhook; agent processes `payment_intent.succeeded` twice. | `webhook-chaos.yaml` |
+| F4 | **Webhook Reordering** | Events arrive out of order; an agent that drops "older" events misses an async payment failure. | `webhook-out-of-order.yaml` |
+| F5 | **Stale Webhook Replay** | An old event is replayed with its original, now-expired signature. | `forged-webhook.yaml`, `webhook-chaos.yaml` |
+| F6 | **Partial Capture Mismatch** | Captured amount differs from the expected amount; agent doesn't notice. | Planned |
+| F7 | **Refund Exceeds Capture** | Agent issues a refund larger than the captured amount. | Planned |
+| F8 | **Forged Webhook** | An event signed with the wrong secret claims a payment succeeded. | `forged-webhook.yaml` |
+| F9 | **Abandoned Authorization** | Task is aborted after authorizing; holds are left on the card. | `abort-cleanup.yaml` |
+| F10 | **Rate-Limit Hammering** | Agent retries 429s immediately instead of backing off. | `rate-limit-storm.yaml` |
 
 ---
 
 ## Quickstart
 
 ```bash
-# Install
-pip install agentpay-harness
+# Install from source (not yet published to PyPI)
+pip install -e ".[dev]"
 
-# Copy and fill in your Stripe test-mode credentials
-cp .env.example .env
+# Optional: use a Stripe test-mode key. With no key set, runs are fully offline.
+export STRIPE_TEST_SECRET_KEY=sk_test_...
 
-# Run a scenario
+# Run one scenario
 agentpay run scenarios/duplicate-on-timeout.yaml
 
-# Run all scenarios in a directory
+# Run every scenario in a directory (prints a summary, exits 1 if any fail)
 agentpay run scenarios/
 
-# Run with verbose output
-agentpay run scenarios/duplicate-on-timeout.yaml --verbose
+# Run against one of the deliberately broken agents to watch the harness catch it
+agentpay run scenarios/runaway-spend.yaml --agent agentpay_harness.adapters.broken.BrokenBudgetAgent
+
+# Save traces (a directory run writes one <scenario>.json per scenario)
+agentpay run scenarios/ -o traces/
+agentpay replay traces/runaway-spend.json
+
+# Shrink a failing fault schedule to a minimal reproduction
+agentpay run scenarios/duplicate-on-timeout.yaml --agent agentpay_harness.adapters.broken.BrokenIdempotencyAgent --shrink-on-failure
+
+# Validate a scenario file without running it
+agentpay validate scenarios/webhook-chaos.yaml
 
 # List available invariants
 agentpay invariants list
 ```
+
+To test your own agent, implement the `AgentUnderTest` protocol (`plan`, `pay`, `on_event`, `ledger`) from `agentpay_harness/adapters/protocol.py` and pass its dotted path to `--agent`.
 
 ---
 
 ## Architecture
 
 ```
-agentpay-harness/
-├── pyproject.toml              # Package metadata, tool config
-├── README.md
-├── LICENSE
-├── .env.example                # Template for Stripe test-mode keys
-├── .gitignore
+agentpay_harness/
+├── cli.py                 # Click CLI: run, replay, validate, invariants list
+├── driver.py              # HarnessDriver — runs one scenario against one agent
+├── scenario.py            # YAML scenario loading & validation
+├── types.py               # Shared dataclasses / enums (Task, Intent, FaultConfig, ...)
+├── safety.py              # Live-key refusal, livemode response guard
+├── ledger.py              # Ledger ↔ Stripe reconciliation
+├── report.py              # Rich report output, trace save/load
+├── shrink.py              # Fault-schedule shrinker (minimal repro)
 │
-├── agentpay_harness/           # Main package
-│   ├── __init__.py             # Version, top-level exports
-│   ├── cli.py                  # Click CLI entrypoint
-│   ├── runner.py               # Scenario execution engine
-│   ├── config.py               # YAML scenario parsing & validation
-│   │
-│   ├── adapters/               # Agent framework integrations
-│   │   └── __init__.py
-│   │
-│   ├── faults/                 # Fault injection middleware
-│   │   ├── __init__.py
-│   │   ├── delay.py            # delay_response
-│   │   ├── drop.py             # drop_response
-│   │   ├── error.py            # error_response
-│   │   └── webhook_faults.py   # duplicate / reorder / replay
-│   │
-│   ├── stripeio/               # Managed Stripe API client
-│   │   ├── __init__.py
-│   │   ├── client.py           # HTTP transport + middleware stack
-│   │   └── models.py           # Pydantic models for Stripe objects
-│   │
-│   ├── webhooks/               # Local webhook receiver
-│   │   ├── __init__.py
-│   │   ├── server.py           # ASGI webhook endpoint
-│   │   └── proxy.py            # Fault proxy for webhook events
-│   │
-│   └── invariants/             # Post-run safety checks
-│       ├── __init__.py
-│       ├── budget.py           # I2, I3, I4, I11
-│       ├── idempotency.py      # I1, I9
-│       ├── webhooks.py         # I6, I7, I8
-│       ├── lifecycle.py        # I5
-│       └── refunds.py          # I10
+├── adapters/
+│   ├── protocol.py        # AgentUnderTest / StripeClient protocols
+│   ├── reference.py       # ReferenceAgent — correct baseline that passes every scenario
+│   └── broken.py          # 9 deliberately broken agents, one per bug class
 │
-├── scenarios/                  # Example YAML scenario files
-│   ├── duplicate-on-timeout.yaml
-│   ├── runaway-spend.yaml
-│   └── webhook-chaos.yaml
+├── faults/
+│   ├── engine.py          # Seeded fault engine: matches rules to requests & webhooks
+│   ├── transport.py       # Request faults: drop, 429, 5xx, delay, duplicate
+│   ├── webhook.py         # Webhook faults: duplicate, reorder, replay
+│   └── actions.py         # FaultAction / WebhookAction types
 │
-├── docs/
-│   └── FAILURES.md             # Detailed failure mode catalog
+├── stripeio/
+│   ├── client.py          # RecordingStripeClient (real test mode, stripe-mock, or offline mock)
+│   └── recorder.py        # EventRecorder — timeline of requests & webhooks
 │
-└── tests/                      # Test suite
-    ├── conftest.py
-    ├── test_invariants.py
-    ├── test_faults.py
-    └── test_scenarios.py
+├── webhooks/
+│   ├── receiver.py        # Webhook delivery system + local HTTP receiver
+│   └── signatures.py      # Stripe-style HMAC signature signing / verification
+│
+└── invariants/
+    ├── checker.py         # Invariant registry
+    └── checks.py          # I1–I11
+
+scenarios/                 # 7 scenarios, one or more per failure mode
+docs/FAILURES.md           # Failure mode catalog
+tests/                     # pytest suite (see "Tests for the Tester")
 ```
+
+### How a run works
+
+1. The agent **plans** the task into intents, then **pays** each one through a recording Stripe client that applies request faults.
+2. Webhook events (`payment_intent.created`, `.succeeded`, `.payment_failed`) are **queued** with increasing timestamps, then **delivered** after the payments the way Stripe delivers them, asynchronously. Each delivery is signed (`StripeEvent.payload` + `StripeEvent.signature_header`) with `HARNESS_WEBHOOK_SECRET`. Duplicates, reordering, stale replays and forgeries are applied at this stage.
+3. If the scenario sets `abort: true`, the driver calls the agent's `abort(client)`.
+4. The invariants are checked against the recorded requests, deliveries and the agent's ledger.
+
+### Fault types
+
+| Fault | Applies to | Effect |
+|---|---|---|
+| `drop_response` | request | Stripe processes the request; the response is lost (timeout) |
+| `rate_limit` | request | 429 response |
+| `server_error` | request | 5xx response |
+| `delay_response` | request | Response delayed by `ms` |
+| `duplicate_request` | request | Request sent twice |
+| `async_payment_failure` | request | PaymentIntent comes back `processing`, then fails; only a webhook says so (offline mode only) |
+| `duplicate_webhook` | webhook | Event delivered `times` times |
+| `reorder_webhooks` | webhook | Deliveries shuffled within `window` (always out of order) |
+| `replay_webhook` | webhook | Event re-delivered later with its original signature, `delay_s` old (stale past 300s) |
+| `forged_webhook` | webhook | Extra event for a fake PaymentIntent, signed with the wrong secret |
+| `clock_skew` | — | Parsed but not yet implemented |
+
+Scenario files can also set `capture_method: manual` (authorize now, capture later) and `abort: true`.
 
 ---
 
 ## Invariants
 
-Every scenario specifies which invariants must hold after the run.  The harness checks each one and reports pass/fail with a human-readable explanation.
+Each scenario lists the invariants it asserts (`assert:`); if none are listed, all are checked.  These IDs match `agentpay invariants list` and `agentpay_harness/invariants/checks.py`.
 
-| ID | Invariant | Description |
-|----|-----------|-------------|
-| **I1** | Idempotency keys present | Every mutating Stripe API call carries an `Idempotency-Key` header. |
-| **I2** | Budget gate | Agent checks remaining budget before initiating any charge. |
-| **I3** | Atomic budget decrement | Budget is decremented with compare-and-swap, not read-then-write. |
-| **I4** | Total ≤ budget | Total captured amount never exceeds the authorised budget. |
-| **I5** | Terminal state reached | Every PaymentIntent reaches a terminal state (`succeeded`, `canceled`) within the timeout. |
-| **I6** | Webhook idempotency | Duplicate webhook events do not cause duplicate side-effects. |
-| **I7** | Event ordering tolerance | Agent does not assume webhook delivery order. |
-| **I8** | Stale replay rejection | Webhook events older than the tolerance window are discarded. |
-| **I9** | No duplicate intents | No two PaymentIntents correspond to the same logical purchase. |
-| **I10** | Refund ≤ capture | Refund amount never exceeds captured amount for any PaymentIntent. |
-| **I11** | Serialised budget mutations | Budget modifications are serialised — no concurrent read-modify-write races. |
+| ID | Invariant | Typically violated by |
+|----|-----------|-----------------------|
+| **I1** | At most one successful charge per intent | Retrying without a stable idempotency key |
+| **I2** | Total captured amount within budget | Check-then-act race on the budget |
+| **I3** | Every charge has an approved intent in the ledger | Agent loses its own ledger write |
+| **I4** | Idempotency key reuse returns the original response | Timestamp-derived or otherwise unstable keys |
+| **I5** | Idempotency key mismatch returns a 400 error | Mutating amount/currency on retry |
+| **I6** | Webhook events processed at most once | No event-ID deduplication |
+| **I7** | Event processing is order-independent | Trusting arrival order for terminal states |
+| **I8** | Webhook signatures verified before processing | Acting on a forged or stale (expired-signature) event |
+| **I9** | Abort cleans up (no dangling captures or unrefunded charges) | Missing cancel / compensating action |
+| **I10** | Rate-limit retries use exponential backoff | Retrying < 100 ms after a 429, or backoff that doesn't grow |
+| **I11** | Ledger reconciles with Stripe records | Partial-failure amnesia, untracked funds |
 
 ---
 
@@ -138,46 +156,46 @@ Every scenario specifies which invariants must hold after the run.  The harness 
 > [!CAUTION]
 > **This tool is designed exclusively for Stripe test mode.**
 
-- The harness **refuses to start** if it detects a live-mode secret key (`sk_live_*`).
-- All PaymentIntents are created against Stripe's test-mode API or a local [`stripe-mock`](https://github.com/stripe/stripe-mock) instance.
+- The harness **refuses to start** if it detects a live key (`sk_live_*` or `rk_live_*`), and only accepts `sk_test_`, `rk_test_`, or `mock_` prefixes.
+- Any API response with `livemode: true` aborts the run immediately.
+- With no key configured, everything runs against a built-in offline mock.  `--base-url` points the client at a local [`stripe-mock`](https://github.com/stripe/stripe-mock).
 - No real money is moved.  No real cards are charged.
-- Webhook signature verification uses your test-mode webhook secret (`whsec_test_*`).
-- Scenario seeds ensure deterministic fault injection for reproducible test runs.
+- Scenario seeds make fault injection deterministic and reproducible.
 
 > [!IMPORTANT]
-> **Never commit `.env` files or raw API keys to version control.**  The `.gitignore` is pre-configured to exclude them, but always double-check before pushing.
+> **Never commit `.env` files or raw API keys to version control.**  The harness reads keys from environment variables (`STRIPE_TEST_SECRET_KEY`, falling back to `STRIPE_API_KEY`) or `--stripe-key`; it does not load `.env` files itself.
 
 ---
 
 ## Tests for the Tester
 
-`agentpay-harness` tests itself.  The `tests/` directory contains a full pytest suite that validates:
+`agentpay-harness` tests itself.  The `tests/` suite covers:
 
-1. **Invariant correctness** — synthetic event logs are fed to each invariant checker; known-good logs must pass and known-bad logs must fail.  This ensures the invariants themselves don't have false positives or false negatives.
+1. **Broken agents get caught, end to end** (`test_broken_agents.py`, `test_scenarios.py`) — the `ReferenceAgent` must pass every bundled scenario, and each of the nine broken agents must trip its matching invariant in a real scenario run.  This is what proves the invariants actually detect bugs.
+2. **Invariant correctness** (`test_invariants.py`, `test_more_invariants.py`) — synthetic logs for I1–I11: known-good must pass, known-bad must fail.  Also covers ledger reconciliation and the shrinker.
+3. **Live-key rejection** (`test_safety.py`) — live secret and restricted keys are refused by the validator and the recording client; `livemode: true` responses are flagged.
 
-2. **Fault determinism** — given the same scenario seed, the fault injection layer must produce identical perturbations across runs.  Tests assert byte-level reproducibility.
-
-3. **Scenario parsing** — malformed YAML, missing fields, out-of-range values, and unknown fault types must all produce clear, actionable error messages rather than silent misbehaviour.
-
-4. **Live-key rejection** — the harness must raise `LiveKeyError` if a `sk_live_*` key is detected in the environment, regardless of how it's injected (env var, `.env` file, CLI flag).
-
-Run the suite:
+Run the suite and checks:
 
 ```bash
 pip install -e ".[dev]"
 pytest
+ruff check .
 ```
 
 ---
 
 ## Honest Limitations
 
-- **No real agent integration yet.**  The `adapters/` package defines the interface but ships no concrete adapters.  You'll need to implement one for your agent framework.
-- **stripe-mock fidelity.**  `stripe-mock` does not simulate all Stripe behaviour (e.g., webhook delivery, 3D Secure flows, asynchronous settlement).  Some invariants can only be fully validated against Stripe's test-mode API.
-- **Single-currency only.**  The budget system assumes USD.  Multi-currency support is not implemented.
-- **No persistent state.**  Each scenario run is independent.  There is no cross-run state, trend tracking, or regression detection.
-- **Webhook faults are synthetic.**  The harness injects webhook faults locally; it does not intercept real Stripe webhook deliveries.
-- **Coverage gaps.**  The 7 failure modes and 11 invariants are a starting point, not an exhaustive list.  Payment systems have a long tail of subtle bugs.
+- **Reference and broken agents only.**  The bundled adapters are test fixtures, not integrations with a real agent framework (LangChain, OpenAI Agents, etc.).  You implement `AgentUnderTest` for your own agent.
+- **Simple task planning.**  `ReferenceAgent.plan()` understands tasks like "buy three packs at $75 each"; anything else becomes a single charge for the full budget.
+- **Webhooks are synthetic.**  The driver generates and signs webhook events locally from payment results; it does not intercept real Stripe deliveries.
+- **Async failures are offline only.**  `async_payment_failure` needs the built-in mock; against Stripe test mode or stripe-mock it is ignored with a warning.
+- **stripe-mock fidelity.**  `stripe-mock` does not simulate webhook delivery, 3D Secure, or asynchronous settlement.  Some invariants are only fully meaningful against Stripe test mode.
+- **F6 / F7 not implemented.**  Partial-capture and refund-overflow faults, and a refund ≤ capture invariant, are designed in `docs/FAILURES.md` but not built.
+- **Single currency.**  Budgets assume USD.
+- **No persistent state.**  Each run is independent; no cross-run trend tracking.
+- **Coverage gaps.**  These failure modes and 11 invariants are a starting point, not an exhaustive list.
 
 ---
 
@@ -193,7 +211,7 @@ Contributions are welcome!  Please:
    mypy agentpay_harness/
    pytest --cov
    ```
-4. Add tests for any new invariants or fault types.
+4. Add tests for any new invariants or fault types — ideally a new broken agent that the invariant catches.
 5. Open a PR with a clear description of what and why.
 
 ---

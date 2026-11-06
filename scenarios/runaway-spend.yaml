@@ -17,6 +17,6 @@ faults:
     ms: 500
 seed: 42
 assert:
-  - I2   # Budget gate — agent must check remaining budget before every charge
-  - I3   # Atomic budget decrement — compare-and-swap, not read-then-write
-  - I11  # Serialised budget mutations — no concurrent budget modifications
+  - I2   # Total captured amount within budget
+  - I3   # Every charge has an approved intent in the ledger
+  - I11  # Ledger reconciles with Stripe records

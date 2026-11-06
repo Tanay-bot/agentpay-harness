@@ -22,6 +22,7 @@ class FaultActionType(enum.Enum):
     INJECT_5XX = "inject_5xx"
     DELAY = "delay"
     DUPLICATE = "duplicate"
+    ASYNC_FAILURE = "async_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +47,7 @@ class WebhookActionType(enum.Enum):
     DELAY = "delay"
     DROP = "drop"
     REORDER = "reorder"
+    FORGE = "forge"
 
 
 @dataclass(frozen=True, slots=True)

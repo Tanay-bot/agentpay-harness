@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
+from itertools import pairwise
 from typing import Any
 
 from agentpay_harness.stripeio.recorder import EventRecorder
@@ -517,11 +518,13 @@ class EventProcessingOrderIndependent:
 
 @dataclass(slots=True)
 class WebhookSignaturesVerified:
-    """I8 — Agent must not process events with invalid signatures.
+    """I8 — Agent must not act on events whose signature is invalid or stale.
 
-    Checks whether the recorder contains webhook deliveries flagged as
-    having invalid or expired signatures, and whether the agent still
-    processed them (i.e. the event appears in the ledger).
+    The delivery system records its own verdict for every delivery
+    (``recorder.deliveries``).  Any event that was only ever delivered with a
+    bad signature must leave no trace in the agent's ledger: neither an entry
+    caused by it (``metadata["event_id"]``) nor an entry for the PaymentIntent
+    it names.
     """
 
     invariant_id: str = "I8"
@@ -535,42 +538,55 @@ class WebhookSignaturesVerified:
     ) -> list[InvariantViolation]:
         violations: list[InvariantViolation] = []
 
-        # Collect event IDs that had invalid signatures from the timeline
-        invalid_sig_event_ids: set[str] = set()
-        for entry in recorder.timeline:
-            if entry.entry_type == "webhook_delivery":
-                meta = entry.metadata or {}
-                if meta.get("signature_valid") is False:
-                    evt_id = meta.get("event_id")
-                    if evt_id:
-                        invalid_sig_event_ids.add(evt_id)
-
-        if not invalid_sig_event_ids:
+        valid_ids = {d.event_id for d in recorder.deliveries if d.signature_valid}
+        invalid_ids = {d.event_id for d in recorder.deliveries if not d.signature_valid} - valid_ids
+        if not invalid_ids:
             return violations
 
-        # Check if any of these event IDs appear in the ledger
-        ledger_event_ids: set[str] = set()
-        for le in ledger:
-            eid = le.metadata.get("event_id")
-            if eid:
-                ledger_event_ids.add(eid)
+        # PaymentIntents named only by invalid events (a forgery's fake PI).
+        pi_by_event: dict[str, str] = {}
+        valid_pis: set[str] = set()
+        for evt in recorder.events:
+            pi_id = (evt.data.get("object") or {}).get("id")
+            if not pi_id:
+                continue
+            if evt.event_id in invalid_ids:
+                pi_by_event[evt.event_id] = str(pi_id)
+            else:
+                valid_pis.add(str(pi_id))
+        for rec in recorder.requests:
+            if rec.response_body and rec.response_body.get("id"):
+                valid_pis.add(str(rec.response_body["id"]))
 
-        processed_invalid = invalid_sig_event_ids & ledger_event_ids
-        for evt_id in sorted(processed_invalid):
-            violations.append(
-                InvariantViolation(
-                    invariant_id=self.invariant_id,
-                    description=(
-                        f"Event {evt_id} had an invalid/expired signature "
-                        f"but was still processed by the agent"
-                    ),
-                    severity=Severity.CRITICAL,
-                    evidence={
-                        "event_id": evt_id,
-                        "reason": "invalid_signature",
-                    },
+        for evt_id in sorted(invalid_ids):
+            forged_pi = pi_by_event.get(evt_id)
+            hits = [
+                le
+                for le in ledger
+                if le.metadata.get("event_id") == evt_id
+                or (
+                    forged_pi is not None
+                    and forged_pi not in valid_pis
+                    and le.stripe_payment_intent_id == forged_pi
                 )
-            )
+            ]
+            if hits:
+                violations.append(
+                    InvariantViolation(
+                        invariant_id=self.invariant_id,
+                        description=(
+                            f"Event {evt_id} had an invalid/expired signature "
+                            f"but was still processed by the agent"
+                        ),
+                        severity=Severity.CRITICAL,
+                        evidence={
+                            "event_id": evt_id,
+                            "reason": "invalid_signature",
+                            "payment_intent_id": forged_pi,
+                            "ledger_entry_ids": [le.entry_id for le in hits],
+                        },
+                    )
+                )
         return violations
 
 
@@ -668,12 +684,25 @@ class AbortCleansUp:
 # ---------------------------------------------------------------------------
 
 
+#: Smallest acceptable wait before retrying after a 429.
+MIN_RATE_LIMIT_BACKOFF_S = 0.1
+
+
 @dataclass(slots=True)
 class RateLimitBackoff:
-    """I10 — When 429s are injected, retries must show exponential backoff (≥1.5x)."""
+    """I10 — Retries after a 429 must back off, and the backoff must grow.
+
+    For each endpoint, every request that follows a 429 is a retry; its gap is
+    the time since that 429.  Two rules, robust to jitter:
+
+    1. Every retry gap is at least ``MIN_RATE_LIMIT_BACKOFF_S`` (no tight loops).
+    2. Within a run of consecutive 429s, the last retry gap is at least the
+       first (the backoff grows rather than staying flat or shrinking).
+    """
 
     invariant_id: str = "I10"
     description: str = "Rate-limit retries use exponential backoff"
+    min_backoff_s: float = MIN_RATE_LIMIT_BACKOFF_S
 
     def check(
         self,
@@ -683,57 +712,55 @@ class RateLimitBackoff:
     ) -> list[InvariantViolation]:
         violations: list[InvariantViolation] = []
 
-        # Find all 429 responses and group by endpoint (method + path)
-        rate_limited: dict[str, list[RequestRecord]] = defaultdict(list)
+        by_endpoint: dict[str, list[RequestRecord]] = defaultdict(list)
         for rec in recorder.requests:
-            if rec.response_status == 429:
-                endpoint = f"{rec.method} {rec.path}"
-                rate_limited[endpoint].append(rec)
+            by_endpoint[f"{rec.method} {rec.path}"].append(rec)
 
-        if not rate_limited:
-            return violations
-
-        # For each endpoint, get all requests (429s and subsequent retries)
-        for endpoint in rate_limited:
-            # Get all requests to this endpoint, sorted by timestamp
-            all_reqs = sorted(
-                [r for r in recorder.requests if f"{r.method} {r.path}" == endpoint],
-                key=lambda r: r.timestamp,
-            )
-
-            if len(all_reqs) < 2:
+        for endpoint, recs in by_endpoint.items():
+            if not any(r.response_status == 429 for r in recs):
                 continue
+            recs = sorted(recs, key=lambda r: r.timestamp)
 
-            # Compute gaps between consecutive requests
-            gaps: list[float] = []
-            for i in range(1, len(all_reqs)):
-                gap = (all_reqs[i].timestamp - all_reqs[i - 1].timestamp).total_seconds()
-                gaps.append(gap)
+            # Split into runs of retries that each follow a 429.
+            runs: list[list[float]] = []
+            current: list[float] = []
+            for prev, nxt in pairwise(recs):
+                if prev.response_status == 429:
+                    current.append((nxt.timestamp - prev.timestamp).total_seconds())
+                elif current:
+                    runs.append(current)
+                    current = []
+            if current:
+                runs.append(current)
 
-            # Check that gaps are increasing by at least 1.5x
-            for i in range(1, len(gaps)):
-                if gaps[i - 1] > 0 and gaps[i] < gaps[i - 1] * 1.5:
-                    violations.append(
-                        InvariantViolation(
-                            invariant_id=self.invariant_id,
-                            description=(
-                                f"Retry gap on {endpoint} did not increase "
-                                f"by ≥1.5x: gap[{i - 1}]={gaps[i - 1]:.3f}s, "
-                                f"gap[{i}]={gaps[i]:.3f}s"
-                            ),
-                            severity=Severity.WARNING,
-                            evidence={
-                                "endpoint": endpoint,
-                                "gap_index": i,
-                                "previous_gap_s": round(gaps[i - 1], 4),
-                                "current_gap_s": round(gaps[i], 4),
-                                "ratio": round(gaps[i] / gaps[i - 1], 4) if gaps[i - 1] > 0 else 0,
-                                "all_gaps_s": [round(g, 4) for g in gaps],
-                                "total_requests": len(all_reqs),
-                            },
-                        )
+            for gaps in runs:
+                problem: str | None = None
+                too_short = [g for g in gaps if g < self.min_backoff_s]
+                if too_short:
+                    problem = (
+                        f"retried {min(too_short):.3f}s after a 429 "
+                        f"(minimum {self.min_backoff_s:.3f}s)"
                     )
-                    break  # One violation per endpoint is enough
+                elif len(gaps) >= 2 and gaps[-1] < gaps[0]:
+                    problem = (
+                        f"backoff did not grow across consecutive 429s: "
+                        f"first gap {gaps[0]:.3f}s, last gap {gaps[-1]:.3f}s"
+                    )
+                if problem is None:
+                    continue
+                violations.append(
+                    InvariantViolation(
+                        invariant_id=self.invariant_id,
+                        description=f"No exponential backoff on {endpoint}: {problem}",
+                        severity=Severity.WARNING,
+                        evidence={
+                            "endpoint": endpoint,
+                            "retry_gaps_s": [round(g, 4) for g in gaps],
+                            "min_backoff_s": self.min_backoff_s,
+                        },
+                    )
+                )
+                break  # One violation per endpoint is enough
         return violations
 
 

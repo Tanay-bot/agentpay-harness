@@ -52,6 +52,8 @@ class FaultType(enum.Enum):
     SERVER_ERROR = "server_error"
     DELAY_RESPONSE = "delay_response"
     CLOCK_SKEW = "clock_skew"
+    FORGED_WEBHOOK = "forged_webhook"
+    ASYNC_PAYMENT_FAILURE = "async_payment_failure"
 
 
 class Severity(enum.Enum):
@@ -123,6 +125,7 @@ class Intent:
     idempotency_key: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=_utcnow)
+    capture_method: str = "automatic"
 
     def __post_init__(self) -> None:
         if self.amount_cents <= 0:
@@ -197,6 +200,9 @@ class StripeEvent:
         livemode: Whether this event is from live mode.
         pending_webhooks: Number of pending webhook deliveries.
         api_version: Stripe API version for this event.
+        payload: Raw JSON body as delivered (set by the harness's delivery system).
+        signature_header: ``Stripe-Signature`` header value for ``payload``.  Agents
+            should verify it with :func:`agentpay_harness.webhooks.signatures.verify_signature`.
     """
 
     event_id: str
@@ -206,6 +212,8 @@ class StripeEvent:
     livemode: bool = False
     pending_webhooks: int = 0
     api_version: str | None = None
+    payload: bytes | None = field(default=None, compare=False, repr=False)
+    signature_header: str | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.livemode:
@@ -266,6 +274,8 @@ class ScenarioConfig:
         seed: Random seed for reproducibility.
         assertions: List of invariant IDs to check (e.g. ``["I1", "I4"]``).
         concurrency: Number of concurrent agent executions.
+        capture_method: ``automatic`` or ``manual`` (authorize now, capture later).
+        abort: If true, the driver calls the agent's ``abort(client)`` after paying.
     """
 
     name: str
@@ -275,8 +285,14 @@ class ScenarioConfig:
     faults: list[FaultConfig] = field(default_factory=list)
     assertions: list[str] = field(default_factory=list)
     concurrency: int = 1
+    capture_method: str = "automatic"
+    abort: bool = False
 
     def __post_init__(self) -> None:
+        if self.capture_method not in ("automatic", "manual"):
+            raise ValueError(
+                f"capture_method must be 'automatic' or 'manual', got {self.capture_method!r}"
+            )
         if not self.name:
             raise ValueError("scenario name must not be empty")
         if self.budget_usd <= 0:

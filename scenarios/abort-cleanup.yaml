@@ -1,0 +1,16 @@
+# =============================================================================
+# Scenario: abort-cleanup
+# =============================================================================
+# The agent places two $40 authorizations (manual capture), then the task is
+# aborted before anything is captured.  A correct agent cancels every
+# uncaptured PaymentIntent so no hold is left on the customer's card.
+# =============================================================================
+
+name: abort-cleanup
+budget_usd: 100
+task: "reserve two seats at $40 each"
+capture_method: manual
+abort: true
+seed: 42
+assert:
+  - I9   # Abort cleans up (no dangling authorizations)

@@ -6,7 +6,6 @@ import pytest
 
 from agentpay_harness.safety import (
     LiveKeyError,
-    load_stripe_key_from_env,
     validate_no_live_mode,
     validate_stripe_key,
 )

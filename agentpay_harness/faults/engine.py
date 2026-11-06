@@ -31,6 +31,7 @@ from agentpay_harness.faults.transport import (
 )
 from agentpay_harness.faults.webhook import (
     duplicate_webhook,
+    forged_webhook,
 )
 from agentpay_harness.types import FaultConfig, FaultType, StripeEvent
 
@@ -156,6 +157,12 @@ class FaultEngine:
         if ft is FaultType.DUPLICATE_REQUEST:
             return duplicate_request()
 
+        if ft is FaultType.ASYNC_PAYMENT_FAILURE:
+            return FaultAction(
+                action_type=FaultActionType.ASYNC_FAILURE,
+                fault_description="Payment accepted as 'processing', fails asynchronously",
+            )
+
         return PASS_THROUGH
 
     def _make_webhook_actions(self, cfg: FaultConfig, event: StripeEvent) -> list[WebhookAction]:
@@ -175,6 +182,9 @@ class FaultEngine:
                     fault_description=f"Reorder webhook window={window}",
                 )
             ]
+
+        if ft is FaultType.FORGED_WEBHOOK:
+            return forged_webhook(event)
 
         if ft is FaultType.REPLAY_WEBHOOK:
             delay_ms = (cfg.delay_s or 5) * 1000

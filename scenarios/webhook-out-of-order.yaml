@@ -1,0 +1,25 @@
+# =============================================================================
+# Scenario: webhook-out-of-order
+# =============================================================================
+# Two $50 purchases.  The first is an async payment (think bank debit): Stripe
+# accepts it as "processing" and only later reports, by webhook, that it
+# failed.  Webhooks are then delivered shuffled, so the payment_failed event
+# arrives after newer events for the second purchase.
+#
+# An agent that drops "older" events once it has seen a newer one never learns
+# the first payment failed, and its ledger still shows it as captured.
+# =============================================================================
+
+name: webhook-out-of-order
+budget_usd: 200
+task: "buy two API credit packs at $50 each"
+faults:
+  - type: async_payment_failure
+    on: POST /v1/payment_intents
+    occurrence: 1
+  - type: reorder_webhooks
+    window: 4
+seed: 7
+assert:
+  - I7   # Event processing is order-independent
+  - I11  # Ledger reconciles with Stripe records

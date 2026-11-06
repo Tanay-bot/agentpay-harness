@@ -5,7 +5,7 @@
 #
 #   1. Duplicate delivery — the same payment_intent.succeeded event is
 #      delivered 3 times (Stripe retries on timeout).
-#   2. Reordered events — webhook events within a 5-second window are
+#   2. Reordered events — webhook deliveries within a window of 5 are
 #      shuffled, so the agent might see "succeeded" before "created".
 #   3. Replayed stale event — a payment_intent.created event is replayed
 #      30 seconds after the original, simulating a delayed retry.
@@ -28,6 +28,6 @@ faults:
     delay_s: 30
 seed: 42
 assert:
-  - I6   # Webhook idempotency — duplicate events must not cause duplicate side-effects
-  - I7   # Event ordering — agent must not assume webhook delivery order
-  - I8   # Stale replay rejection — old events beyond a time window must be discarded
+  - I6   # Webhook events processed at most once
+  - I7   # Event processing is order-independent
+  - I8   # Webhook signatures verified (and within tolerance) before processing
