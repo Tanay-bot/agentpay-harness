@@ -11,8 +11,9 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Any
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import Any, cast
 from uuid import uuid4
 
 from agentpay_harness.faults.actions import FaultAction, FaultActionType
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # Optional stripe import — fall back to offline simulation if not installed
 try:
     import stripe
-    from stripe.error import StripeError  # type: ignore[import-untyped]
+    from stripe import StripeError
 
     HAS_STRIPE = True
 except ImportError:
@@ -141,6 +142,7 @@ class _OfflineStripeSimulator:
         payment_intent_id: str,
         *,
         idempotency_key: str | None = None,
+        amount_to_capture: int | None = None,
     ) -> tuple[int, dict[str, Any]]:
         with self._lock:
             pi = self._payment_intents.get(payment_intent_id)
@@ -152,9 +154,29 @@ class _OfflineStripeSimulator:
                     },
                     "_status_code": 404,
                 }
+            if pi.get("status") != "requires_capture":
+                return 400, {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "payment_intent_unexpected_state",
+                        "message": f"PaymentIntent is {pi.get('status')!r}, not requires_capture",
+                    },
+                    "_status_code": 400,
+                }
+            captured = pi["amount"] if amount_to_capture is None else amount_to_capture
+            if not 0 < captured <= pi["amount"]:
+                return 400, {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "amount_too_large",
+                        "message": "amount_to_capture must be between 1 and the authorized amount",
+                    },
+                    "_status_code": 400,
+                }
 
             pi["status"] = "succeeded"
-            pi["amount_received"] = pi["amount"]
+            pi["amount_received"] = captured
+            pi["amount_refunded"] = 0
             pi["_status_code"] = 200
 
             now_ts = int(time.time())
@@ -170,8 +192,73 @@ class _OfflineStripeSimulator:
                 "created": now_ts,
                 "status": "available",
             }
+            if captured != pi["amount"]:
+                txn["amount"] = txn["net"] = captured
             self._balance_transactions.append(txn)
             return 200, copy.deepcopy(pi)
+
+    def authorized_amount(self, payment_intent_id: str) -> int | None:
+        with self._lock:
+            pi = self._payment_intents.get(payment_intent_id)
+            return None if pi is None else int(pi["amount"])
+
+    def create_refund(
+        self,
+        payment_intent_id: str,
+        *,
+        amount: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Refund part or all of a captured PaymentIntent, as Stripe does.
+
+        Rejects refunds larger than what is still refundable (captured minus
+        already refunded) with ``amount_too_large``.
+        """
+        with self._lock:
+            if idempotency_key is not None and idempotency_key in self._idempotency_store:
+                return 200, copy.deepcopy(self._idempotency_store[idempotency_key]["response"])
+            pi = self._payment_intents.get(payment_intent_id)
+            if pi is None:
+                return 404, {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": f"No such payment_intent: '{payment_intent_id}'",
+                    },
+                    "_status_code": 404,
+                }
+            captured = int(pi.get("amount_received") or 0)
+            already = int(pi.get("amount_refunded") or 0)
+            refundable = captured - already
+            requested = refundable if amount is None else amount
+            if requested <= 0 or requested > refundable:
+                return 400, {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "amount_too_large",
+                        "message": (
+                            f"Refund amount ({requested}) is greater than the unrefunded "
+                            f"amount on the charge ({refundable})."
+                        ),
+                    },
+                    "_status_code": 400,
+                }
+            pi["amount_refunded"] = already + requested
+            refund = {
+                "id": f"re_mock_{uuid4().hex[:20]}",
+                "object": "refund",
+                "amount": requested,
+                "currency": pi["currency"],
+                "payment_intent": payment_intent_id,
+                "status": "succeeded",
+                "created": int(time.time()),
+                "_status_code": 200,
+            }
+            if idempotency_key is not None:
+                self._idempotency_store[idempotency_key] = {
+                    "params": {"amount": requested, "currency": pi["currency"]},
+                    "response": copy.deepcopy(refund),
+                }
+            return 200, copy.deepcopy(refund)
 
     def cancel_payment_intent(self, payment_intent_id: str) -> tuple[int, dict[str, Any]]:
         with self._lock:
@@ -346,7 +433,9 @@ class RecordingStripeClient:
 
         def _do_offline() -> tuple[int, dict[str, Any]]:
             return self._offline_sim.capture_payment_intent(
-                payment_intent_id, idempotency_key=idempotency_key
+                payment_intent_id,
+                idempotency_key=idempotency_key,
+                amount_to_capture=kwargs.get("amount_to_capture"),
             )
 
         def _do_stripe() -> Any:
@@ -380,6 +469,40 @@ class RecordingStripeClient:
             body=None,
             headers={},
             idempotency_key=None,
+            offline_fn=_do_offline,
+            stripe_fn=_do_stripe,
+        )
+
+    def create_refund(
+        self,
+        payment_intent_id: str,
+        *,
+        amount: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Refund a captured PaymentIntent (all of it when ``amount`` is None)."""
+        params: dict[str, Any] = {"payment_intent": payment_intent_id}
+        if amount is not None:
+            params["amount"] = amount
+        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+
+        def _do_offline() -> tuple[int, dict[str, Any]]:
+            return self._offline_sim.create_refund(
+                payment_intent_id, amount=amount, idempotency_key=idempotency_key
+            )
+
+        def _do_stripe() -> Any:
+            call_kwargs = dict(self._stripe_kwargs)
+            if idempotency_key:
+                call_kwargs["idempotency_key"] = idempotency_key
+            return stripe.Refund.create(**params, **call_kwargs)
+
+        return self._call(
+            method="POST",
+            path="/v1/refunds",
+            body=params,
+            headers=headers,
+            idempotency_key=idempotency_key,
             offline_fn=_do_offline,
             stripe_fn=_do_stripe,
         )
@@ -428,7 +551,7 @@ class RecordingStripeClient:
             stripe_fn=_do_stripe,
         )
         if isinstance(res, dict) and "data" in res:
-            return res["data"]
+            return cast("list[dict[str, Any]]", res["data"])
         return []
 
     def list_balance_transactions(
@@ -456,7 +579,7 @@ class RecordingStripeClient:
             stripe_fn=_do_stripe,
         )
         if isinstance(res, dict) and "data" in res:
-            return res["data"]
+            return cast("list[dict[str, Any]]", res["data"])
         return []
 
     # ------------------------------------------------------------------
@@ -538,7 +661,7 @@ class RecordingStripeClient:
                     body=body,
                     headers=headers,
                     idempotency_key=idempotency_key,
-                    timestamp=datetime.now(tz=UTC),
+                    timestamp=datetime.now(tz=timezone.utc),
                     response_status=0,
                     response_body=recorded_body,
                     response_time_ms=0.0,
@@ -571,7 +694,7 @@ class RecordingStripeClient:
                     body=body,
                     headers=headers,
                     idempotency_key=idempotency_key,
-                    timestamp=datetime.now(tz=UTC),
+                    timestamp=datetime.now(tz=timezone.utc),
                     response_status=429,
                     response_body=resp_body,
                     response_time_ms=0.0,
@@ -599,7 +722,7 @@ class RecordingStripeClient:
                     body=body,
                     headers=headers,
                     idempotency_key=idempotency_key,
-                    timestamp=datetime.now(tz=UTC),
+                    timestamp=datetime.now(tz=timezone.utc),
                     response_status=status,
                     response_body=resp_body,
                     response_time_ms=0.0,
@@ -610,6 +733,39 @@ class RecordingStripeClient:
 
             if fault.action_type is FaultActionType.DELAY and fault.delay_ms:
                 time.sleep(fault.delay_ms / 1000.0)
+
+            if fault.action_type is FaultActionType.PARTIAL_CAPTURE:
+                offline = self._force_offline or not HAS_STRIPE or stripe is None
+                parts = path.strip("/").split("/")
+                pi_id = parts[2] if len(parts) == 4 and parts[3] == "capture" else None
+                authorized = self._offline_sim.authorized_amount(pi_id) if pi_id else None
+                if not offline or pi_id is None or authorized is None:
+                    logger.warning("partial_capture only applies offline to a capture; ignoring")
+                else:
+                    percent = int((fault.response_override or {}).get("percent", 50))
+                    partial = max(1, authorized * percent // 100)
+
+                    def _partial_offline() -> tuple[int, dict[str, Any]]:
+                        return self._offline_sim.capture_payment_intent(
+                            str(pi_id), idempotency_key=idempotency_key, amount_to_capture=partial
+                        )
+
+                    resp = self._call_internal(
+                        method,
+                        path,
+                        body,
+                        headers,
+                        idempotency_key,
+                        _partial_offline,
+                        stripe_fn,
+                        t0,
+                    )
+                    with self._lock:
+                        if self._records and self._records[-1].response_body is resp:
+                            self._records[-1] = replace(
+                                self._records[-1], fault_injected=fault.fault_description
+                            )
+                    return resp
 
             if fault.action_type is FaultActionType.ASYNC_FAILURE:
                 resp = self._call_internal(
@@ -666,7 +822,7 @@ class RecordingStripeClient:
                 body=body,
                 headers=headers,
                 idempotency_key=idempotency_key,
-                timestamp=datetime.now(tz=UTC),
+                timestamp=datetime.now(tz=timezone.utc),
                 response_status=status_code,
                 response_body=resp_dict,
                 response_time_ms=elapsed_ms,
@@ -695,7 +851,7 @@ class RecordingStripeClient:
                 body=body,
                 headers=headers,
                 idempotency_key=idempotency_key,
-                timestamp=datetime.now(tz=UTC),
+                timestamp=datetime.now(tz=timezone.utc),
                 response_status=200,
                 response_body=resp_dict,
                 response_time_ms=elapsed_ms,
@@ -720,7 +876,7 @@ class RecordingStripeClient:
                 body=body,
                 headers=headers,
                 idempotency_key=idempotency_key,
-                timestamp=datetime.now(tz=UTC),
+                timestamp=datetime.now(tz=timezone.utc),
                 response_status=status_code,
                 response_body=err_dict,
                 response_time_ms=elapsed_ms,

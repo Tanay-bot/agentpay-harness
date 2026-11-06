@@ -35,6 +35,9 @@ from agentpay_harness.faults.webhook import (
 )
 from agentpay_harness.types import FaultConfig, FaultType, StripeEvent
 
+#: Faults applied by the driver / delivery queue as a whole, not per event.
+_QUEUE_LEVEL_FAULTS = {FaultType.CLOCK_SKEW, FaultType.INTERLEAVE, FaultType.REORDER_WEBHOOKS}
+
 
 class FaultEngine:
     """Evaluates configured fault rules against requests and webhook events."""
@@ -83,7 +86,7 @@ class FaultEngine:
 
         with self._lock:
             for cfg in self._configs:
-                if not self._matches_event(cfg, event):
+                if cfg.type in _QUEUE_LEVEL_FAULTS or not self._matches_event(cfg, event):
                     continue
 
                 rule_id = self._rule_id(cfg)
@@ -99,6 +102,13 @@ class FaultEngine:
 
                 self._occurrence_counts[rule_id] = fired + 1
                 actions.extend(self._make_webhook_actions(cfg, event))
+
+        # Several faults may each include the original delivery; deliver it once.
+        originals = [
+            a for a in actions if a.action_type is WebhookActionType.DELIVER and a.event is event
+        ]
+        for extra in originals[1:]:
+            actions.remove(extra)
 
         if not actions:
             actions.append(
@@ -130,8 +140,7 @@ class FaultEngine:
 
     @staticmethod
     def _rule_id(cfg: FaultConfig) -> str:
-        f_type = getattr(cfg, "type", None) or getattr(cfg, "fault_type", None)
-        type_val = f_type.value if hasattr(f_type, "value") else str(f_type)
+        type_val = cfg.type.value
         target = cfg.on or cfg.event or ""
         return f"{type_val}:{target}"
 
@@ -156,6 +165,13 @@ class FaultEngine:
 
         if ft is FaultType.DUPLICATE_REQUEST:
             return duplicate_request()
+
+        if ft is FaultType.PARTIAL_CAPTURE:
+            return FaultAction(
+                action_type=FaultActionType.PARTIAL_CAPTURE,
+                response_override={"percent": cfg.percent or 50},
+                fault_description=f"Captured only {cfg.percent or 50}% of the authorized amount",
+            )
 
         if ft is FaultType.ASYNC_PAYMENT_FAILURE:
             return FaultAction(

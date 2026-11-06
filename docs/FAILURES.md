@@ -1,6 +1,6 @@
 # Failure Mode Catalog
 
-This document describes **10 failure modes** that affect AI-agent payment flows. F1–F5 and F8–F10 are reproduced by the bundled scenarios; F6 and F7 are **planned** — the fault types they need (`partial_capture`, `error_response`) are not implemented yet.
+This document describes **10 failure modes** that affect AI-agent payment flows. Each is reproduced by at least one bundled scenario, and each has a deliberately broken agent in `agentpay_harness/adapters/broken.py` that the scenario catches.
 
 Invariant IDs below refer to the checks in `agentpay_harness/invariants/checks.py` (run `agentpay invariants list`).  Each entry covers what goes wrong in production, how the harness reproduces it, how to fix it, and which invariants catch it.
 
@@ -13,8 +13,8 @@ Invariant IDs below refer to the checks in `agentpay_harness/invariants/checks.p
 3. [F3 — Webhook Duplication](#f3--webhook-duplication)
 4. [F4 — Webhook Reordering](#f4--webhook-reordering)
 5. [F5 — Stale Webhook Replay](#f5--stale-webhook-replay)
-6. [F6 — Partial Capture Mismatch](#f6--partial-capture-mismatch-planned)
-7. [F7 — Refund Exceeds Capture](#f7--refund-exceeds-capture-planned)
+6. [F6 — Partial Capture Mismatch](#f6--partial-capture-mismatch)
+7. [F7 — Refund Exceeds Capture](#f7--refund-exceeds-capture)
 8. [F8 — Forged Webhook](#f8--forged-webhook)
 9. [F9 — Abandoned Authorization](#f9--abandoned-authorization)
 10. [F10 — Rate-Limit Hammering](#f10--rate-limit-hammering)
@@ -90,6 +90,14 @@ agentpay run scenarios/runaway-spend.yaml
 **Scenario file:** `scenarios/runaway-spend.yaml`
 **Fault:** `delay_response` on `POST /v1/payment_intents/*/capture`, 500 ms.
 **Concurrency:** 3 parallel purchase attempts.
+
+**Two agents, one budget — a deterministic race:**
+
+```bash
+agentpay run scenarios/budget-race.yaml --agent agentpay_harness.adapters.broken.BrokenBudgetAgent
+```
+
+`scenarios/budget-race.yaml` runs two agent instances against one shared $100 budget (`agents: 2`), each wanting $75.  The `interleave` fault with `schedule: [0, 1, 0, 1]` makes agent 0 read the balance, then agent 1 read it, then each write: both saw "$0 spent", both pay, $150 leaves a $100 budget.  The same agent under `[0, 0, 1, 1]` does not overspend, so the failure comes from the interleaving, not from timing luck.  A correct agent uses `SharedBudget.try_reserve()` (check-and-reserve in one step), which passes under every schedule.
 
 ### The Fix
 
@@ -204,6 +212,12 @@ agentpay run scenarios/forged-webhook.yaml
 **Scenario files:** `scenarios/webhook-chaos.yaml` (30 s replay — still within tolerance, so deduplication is what matters) and `scenarios/forged-webhook.yaml` (600 s replay — the original signature has expired and must be rejected).
 **Fault:** `replay_webhook` on `payment_intent.created`.  The replay carries the **original** `Stripe-Signature` header, as a captured-and-replayed request would.
 
+**Clock skew:** `scenarios/clock-skew.yaml` shifts signature timestamps instead (`clock_skew` fault): −120 s on `payment_intent.created` (inside the 300 s tolerance: must be accepted) and +900 s on `payment_intent.succeeded` (outside: must be rejected).
+
+```bash
+agentpay run scenarios/clock-skew.yaml --agent agentpay_harness.adapters.broken.BrokenWebhookVerifyAgent
+```
+
 ### The Fix
 
 - **Verify the signature timestamp.**  Stripe's `verify_signature` rejects headers older than the tolerance (300 s by default).  Stripe re-signs its own retries, so a stale signature means a replayed request.
@@ -218,103 +232,75 @@ agentpay run scenarios/forged-webhook.yaml
 
 ---
 
-## F6 — Partial Capture Mismatch *(planned)*
-
-> **Not implemented yet.** There is no `partial_capture` fault type and no `scenarios/partial-capture.yaml`. The YAML below is a design sketch.
+## F6 — Partial Capture Mismatch
 
 ### Real-World Description
 
-A PaymentIntent is created with `amount=5000` ($50.00) in `manual` capture mode.  The agent later calls `capture` expecting to capture the full $50.00, but due to a fault (API error, partial capture, or currency conversion), the actual captured amount is different — say $48.50.  If the agent doesn't verify the capture response, it records $50.00 as captured while only $48.50 was actually charged.
+An agent authorizes $50.00 with `capture_method=manual` and captures later.  Stripe can capture less than was authorized (the merchant passes `amount_to_capture`, an order is partly fulfilled, an authorization is partly released).  The capture response says what really moved in `amount_received`.  An agent that books the original $50.00 overstates its spend, under-reports its remaining budget, and later tries to refund money it never received (F7).
 
 ### What Happens
 
-1. Agent creates a PaymentIntent with `amount=5000`, `capture_method=manual`.
-2. Agent calls `POST /v1/payment_intents/pi_ABC/capture`.
-3. The harness injects a `partial_capture` fault that modifies the response to show `amount_received=4850`.
-4. Agent records $50.00 captured (based on the original intent amount).
-5. Ledger is now $1.50 out of sync with reality.
+1. Agent creates a PaymentIntent for $50.00 with `capture_method=manual` (`requires_capture`).
+2. The scenario settles (`settle: true`), and the agent calls `POST /v1/payment_intents/pi_.../capture`.
+3. The `partial_capture` fault makes Stripe capture only 60%: `amount_received = 3000`.
+4. A correct agent books $30.00 and returns the unused $20.00 reservation to its budget.
+5. A broken agent books $50.00.
 
 ### Minimal Reproduction
 
-```yaml
-# scenarios/partial-capture.yaml
-name: partial-capture
-budget_usd: 100
-task: "buy one item at $50"
-faults:
-  - type: partial_capture
-    on: POST /v1/payment_intents/*/capture
-    captured_amount: 4850  # $48.50 instead of $50.00
-seed: 42
-assert: [I11]
+```bash
+agentpay run scenarios/partial-capture.yaml --agent agentpay_harness.adapters.broken.BrokenCaptureAgent
 ```
 
-```bash
-agentpay run scenarios/partial-capture.yaml
-```
+**Scenario file:** `scenarios/partial-capture.yaml`
+**Fault:** `partial_capture` with `percent: 60` (offline mock only).
 
 ### The Fix
 
-- **Always read the capture response.**  After calling `capture`, read `amount_received` from the response — not the original `amount` from the PaymentIntent.
-- **Reconcile amounts.**  Compare `amount_received` against the expected amount.  If they differ, log a warning and update your ledger accordingly.
-- **Handle partial captures explicitly.**  If partial capture is possible in your flow, implement logic to handle the difference (e.g., retry capture for the remainder, or adjust the order total).
+- **Read `amount_received` from the capture response**, never the intent's original `amount`.
+- **Release the difference.**  The authorization reserved $50.00 of budget; only $30.00 was spent.
 
 ### Invariants That Catch It
 
 | Invariant | What It Checks |
 |-----------|----------------|
-| **I11** | Ledger reconciliation flags the amount mismatch between the ledger and Stripe (once the fault exists). |
+| **I12** | For every captured PaymentIntent, the ledger amount equals Stripe's `amount_received`. |
 
 ---
 
-## F7 — Refund Exceeds Capture *(planned)*
-
-> **Not implemented yet.** There is no `error_response` fault type, no `scenarios/refund-overflow.yaml`, and no refund ≤ capture invariant. The YAML below is a design sketch.
+## F7 — Refund Exceeds Capture
 
 ### Real-World Description
 
-An agent captures $50.00 on a PaymentIntent and later attempts to issue a full refund.  Due to a bug (e.g., using the original `amount` instead of `amount_received`, or double-refunding), the agent calls `POST /v1/refunds` with `amount=10000` ($100.00).  Stripe will reject this with a `charge_already_refunded` or `amount_too_large` error, but if the agent doesn't handle the error, it may record the refund as successful.
+After the partial capture above, the purchase is refunded.  An agent that refunds the *authorized* $50.00 asks Stripe for more than the $30.00 it captured.  Stripe rejects it (`amount_too_large`), but an agent that doesn't check the response books a $50.00 refund anyway: its ledger now says $50.00 came back when $0.00 did.  The same invariant also catches repeated partial refunds that add up to more than the capture.
 
 ### What Happens
 
-1. Agent captures $50.00 on `pi_ABC`.
-2. Agent (buggy) calls `POST /v1/refunds` with `amount=10000` (double the captured amount).
-3. Stripe returns a 400 error: `"amount_too_large"`.
-4. Agent ignores the error response and records "$100 refunded" in its ledger.
-5. Customer's actual refund: $0.  Agent's ledger: -$100.
+1. Same partial capture as F6 ($50.00 authorized, $30.00 captured).
+2. The scenario refunds (`refund: true`), and the agent calls `POST /v1/refunds`.
+3. Broken agent: asks for $50.00, Stripe answers 400 `amount_too_large`, the agent books a $50.00 refund anyway.
+4. Correct agent: refunds exactly the $30.00 captured and books only what Stripe confirms.
 
 ### Minimal Reproduction
 
-```yaml
-# scenarios/refund-overflow.yaml
-name: refund-overflow
-budget_usd: 100
-task: "buy one item at $50, then refund it"
-faults:
-  - type: error_response
-    on: POST /v1/refunds
-    status: 400
-    code: amount_too_large
-    message: "Refund amount ($100.00) is greater than charge amount ($50.00)"
-seed: 42
-assert: [I11]
+```bash
+agentpay run scenarios/refund-overflow.yaml --agent agentpay_harness.adapters.broken.BrokenRefundAgent
 ```
 
-```bash
-agentpay run scenarios/refund-overflow.yaml
-```
+**Scenario file:** `scenarios/refund-overflow.yaml`
+**Fault:** `partial_capture` with `percent: 60`, then `refund: true`.
 
 ### The Fix
 
-- **Validate refund amount before calling the API.**  Ensure `refund_amount ≤ captured_amount - already_refunded_amount`.
-- **Handle error responses.**  If Stripe returns `amount_too_large`, do not record the refund as successful.  Log the error and alert.
-- **Track refund state.**  Maintain a per-PaymentIntent record of how much has been captured and how much has been refunded.  Never allow `total_refunded > amount_captured`.
+- **Refund at most `amount_received - amount_refunded`.**
+- **Book a refund only after Stripe confirms it** (2xx, `status` `succeeded` or `pending`).
+- **Use an idempotency key on refunds**, so a timed-out refund retried doesn't refund twice.
 
 ### Invariants That Catch It
 
 | Invariant | What It Checks |
 |-----------|----------------|
-| *(none yet)* | A refund-vs-capture invariant still needs to be written; I11 would catch the resulting ledger drift. |
+| **I13** | Per PaymentIntent, refunds confirmed by Stripe (summed) and refunds claimed by the ledger never exceed the captured amount, and the ledger never claims more than Stripe refunded. |
 
 ---
 
@@ -415,12 +401,12 @@ agentpay run scenarios/rate-limit-storm.yaml --agent agentpay_harness.adapters.b
 | Failure | Scenario | Faults | Invariants |
 |---------|----------|--------|------------|
 | F1 — Timeout Duplicate | `duplicate-on-timeout.yaml` | `drop_response`, `rate_limit` | I1, I4, I11 |
-| F2 — Runaway Spend | `runaway-spend.yaml` | `delay_response` | I2, I3, I11 |
+| F2 — Runaway Spend | `runaway-spend.yaml`, `budget-race.yaml` | `delay_response`, `interleave` | I2, I3, I11 |
 | F3 — Webhook Duplication | `webhook-chaos.yaml` | `duplicate_webhook` | I6 |
 | F4 — Webhook Reordering | `webhook-out-of-order.yaml` | `async_payment_failure`, `reorder_webhooks` | I7, I11 |
-| F5 — Stale Replay | `forged-webhook.yaml`, `webhook-chaos.yaml` | `replay_webhook` | I8, I6 |
-| F6 — Partial Capture | *(planned)* | `partial_capture` *(not implemented)* | I11 |
-| F7 — Refund Overflow | *(planned)* | `error_response` *(not implemented)* | *(new invariant needed)* |
+| F5 — Stale Replay / Clock Skew | `forged-webhook.yaml`, `clock-skew.yaml`, `webhook-chaos.yaml` | `replay_webhook`, `clock_skew` | I8, I6 |
+| F6 — Partial Capture | `partial-capture.yaml` | `partial_capture` | I12 |
+| F7 — Refund Overflow | `refund-overflow.yaml` | `partial_capture` + `refund: true` | I13 |
 | F8 — Forged Webhook | `forged-webhook.yaml` | `forged_webhook` | I8 |
 | F9 — Abandoned Authorization | `abort-cleanup.yaml` | `capture_method: manual`, `abort: true` | I9 |
 | F10 — Rate-Limit Hammering | `rate-limit-storm.yaml` | `rate_limit` | I10 |

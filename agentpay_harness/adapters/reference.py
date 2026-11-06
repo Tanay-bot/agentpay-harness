@@ -22,10 +22,12 @@ import random
 import re
 import threading
 import time
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
 from agentpay_harness.adapters.protocol import StripeClient
+from agentpay_harness.budget import SharedBudget
 from agentpay_harness.types import (
     Intent,
     LedgerEntry,
@@ -34,6 +36,7 @@ from agentpay_harness.types import (
     PaymentStatus,
     StripeEvent,
     Task,
+    require_usd,
 )
 from agentpay_harness.webhooks.signatures import HARNESS_WEBHOOK_SECRET, verify_signature
 
@@ -79,6 +82,12 @@ def _parse_item_purchase(description: str) -> tuple[int, int] | None:
     return count, unit_cents
 
 
+def _ok(resp: dict[str, Any]) -> bool:
+    """True when a client response dict is a 2xx success, not an error."""
+    status = resp.get("_status_code", 200)
+    return isinstance(status, int) and 200 <= status < 300 and not resp.get("error")
+
+
 class _RateLimitError(Exception):
     """Raised when Stripe returns HTTP 429."""
 
@@ -111,6 +120,8 @@ class ReferenceAgent:
         self._payment_intent_ids: list[str] = []  # track for abort cleanup
         self._spent_cents: int = 0
         self._budget_cents: int = 0
+        #: Set when several agent instances share one budget (multi-agent scenarios).
+        self._shared_budget: SharedBudget | None = None
 
     # ------------------------------------------------------------------
     # AgentUnderTest protocol
@@ -126,6 +137,9 @@ class ReferenceAgent:
         with self._lock:
             self._budget_cents = task.budget_cents
             self._spent_cents = 0
+            self._shared_budget = task.metadata.get("budget_store")
+            if task.metadata.get("webhook_secret"):
+                self._webhook_secret = str(task.metadata["webhook_secret"])
 
         parsed = _parse_item_purchase(task.description)
         if parsed is not None:
@@ -160,10 +174,12 @@ class ReferenceAgent:
             intent.intent_id, 0
         )
 
-        # Budget gate — check under lock (I2, I3, I11).
+        require_usd(intent.currency, f"intent {intent.intent_id}")
+
+        # Budget gate — check-and-reserve in one atomic step (I2, I3, I11).
         with self._lock:
-            remaining = self._budget_cents - self._spent_cents
-            if intent.amount_cents > remaining:
+            reserved, remaining = self._try_reserve(intent.amount_cents)
+            if not reserved:
                 return PaymentResult(
                     intent_id=intent.intent_id,
                     status=PaymentStatus.FAILED,
@@ -171,9 +187,6 @@ class ReferenceAgent:
                     error=f"Budget exceeded: need {intent.amount_cents}, have {remaining}",
                     idempotency_key=idempotency_key,
                 )
-
-            # Optimistically reserve the budget (I2).
-            self._spent_cents += intent.amount_cents
 
             # Record a PENDING ledger entry (I3, I11).
             pending_entry = LedgerEntry(
@@ -199,7 +212,7 @@ class ReferenceAgent:
         except Exception as exc:
             # Roll back budget reservation on failure.
             with self._lock:
-                self._spent_cents -= intent.amount_cents
+                self._release_budget(intent.amount_cents)
                 self._update_ledger_status(intent.intent_id, LedgerEntryStatus.FAILED)
             return PaymentResult(
                 intent_id=intent.intent_id,
@@ -221,7 +234,7 @@ class ReferenceAgent:
         # If payment didn't succeed, release budget and update ledger.
         if payment_status not in (PaymentStatus.SUCCEEDED, PaymentStatus.PROCESSING):
             with self._lock:
-                self._spent_cents -= intent.amount_cents
+                self._release_budget(intent.amount_cents)
                 self._update_ledger_status(intent.intent_id, LedgerEntryStatus.FAILED, stripe_pi_id)
         elif status_str == "requires_capture":
             # Authorized but not captured: keep the budget reserved, entry PENDING.
@@ -284,13 +297,13 @@ class ReferenceAgent:
                 if entry is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.FAILED)
                     # Release budget for failed payment.
-                    self._spent_cents -= entry.amount_cents
+                    self._release_budget(entry.amount_cents)
         elif event_type == "payment_intent.canceled":
             with self._lock:
                 entry = self._find_ledger_by_stripe_id(stripe_pi_id)
                 if entry is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.VOIDED)
-                    self._spent_cents -= entry.amount_cents
+                    self._release_budget(entry.amount_cents)
         elif event_type == "charge.refunded":
             with self._lock:
                 charge_pi_id = pi_data.get("payment_intent", "")
@@ -298,7 +311,7 @@ class ReferenceAgent:
                     entry = self._find_ledger_by_stripe_id(charge_pi_id)
                     if entry is not None:
                         self._update_ledger_by_stripe_id(charge_pi_id, LedgerEntryStatus.REFUNDED)
-                        self._spent_cents -= entry.amount_cents
+                        self._release_budget(entry.amount_cents)
         else:
             logger.debug("Ignoring unhandled event type: %s", event_type)
 
@@ -330,14 +343,113 @@ class ReferenceAgent:
                         self._update_ledger_by_stripe_id(pi_id, LedgerEntryStatus.VOIDED)
                         entry = self._find_ledger_by_stripe_id(pi_id)
                         if entry is not None:
-                            self._spent_cents -= entry.amount_cents
+                            self._release_budget(entry.amount_cents)
                     logger.info("Canceled uncaptured PaymentIntent %s", pi_id)
             except Exception:
                 logger.exception("Failed to cancel PaymentIntent %s during abort", pi_id)
 
     # ------------------------------------------------------------------
+    # Capture & refund (F6 / F7)
+    # ------------------------------------------------------------------
+
+    def capture_authorized(self, client: StripeClient) -> None:
+        """Capture every authorized PaymentIntent, recording what was *actually* captured.
+
+        Stripe may capture less than was authorized; the ledger must hold
+        ``amount_received``, and the unused reservation goes back to the budget (I12).
+        """
+        with self._lock:
+            pending = [
+                e
+                for e in self._ledger
+                if e.status is LedgerEntryStatus.PENDING and e.stripe_payment_intent_id
+            ]
+        for entry in pending:
+            pi_id = str(entry.stripe_payment_intent_id)
+            resp = client.capture_payment_intent(
+                pi_id, idempotency_key=self._stable_idempotency_key(pi_id, 1)
+            )
+            if not _ok(resp) or resp.get("status") != "succeeded":
+                logger.warning("Capture of %s failed: %s", pi_id, resp.get("error"))
+                continue
+            received = int(resp.get("amount_received") or 0)
+            with self._lock:
+                self._replace_entry(
+                    pi_id,
+                    amount_cents=received,
+                    status=LedgerEntryStatus.CAPTURED,
+                    metadata=dict(entry.metadata, authorized_cents=entry.amount_cents),
+                )
+                if received < entry.amount_cents:
+                    self._release_budget(entry.amount_cents - received)
+
+    def refund_captured(self, client: StripeClient) -> None:
+        """Fully refund every captured payment, never more than was captured (I13).
+
+        Only refunds Stripe confirms are recorded in the ledger.
+        """
+        with self._lock:
+            captured = [
+                e
+                for e in self._ledger
+                if e.status is LedgerEntryStatus.CAPTURED and e.stripe_payment_intent_id
+            ]
+        for entry in captured:
+            pi_id = str(entry.stripe_payment_intent_id)
+            already = int(entry.metadata.get("refunded_cents", 0))
+            refundable = entry.amount_cents - already
+            if refundable <= 0:
+                continue
+            resp = client.create_refund(
+                pi_id,
+                amount=refundable,
+                idempotency_key=self._stable_idempotency_key(pi_id, 2),
+            )
+            if not _ok(resp) or resp.get("status") not in ("succeeded", "pending"):
+                logger.warning("Refund of %s rejected: %s", pi_id, resp.get("error"))
+                continue
+            refunded = already + int(resp.get("amount") or 0)
+            with self._lock:
+                self._replace_entry(
+                    pi_id,
+                    status=(
+                        LedgerEntryStatus.REFUNDED
+                        if refunded >= entry.amount_cents
+                        else LedgerEntryStatus.CAPTURED
+                    ),
+                    metadata=dict(entry.metadata, refunded_cents=refunded),
+                )
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _try_reserve(self, amount_cents: int) -> tuple[bool, int]:
+        """Atomically reserve budget; returns (reserved, remaining before the attempt).
+
+        Must be called with ``self._lock`` held.
+        """
+        if self._shared_budget is not None:
+            remaining = self._shared_budget.total_cents - self._shared_budget.spent_cents
+            return self._shared_budget.try_reserve(amount_cents), remaining
+        remaining = self._budget_cents - self._spent_cents
+        if amount_cents > remaining:
+            return False, remaining
+        self._spent_cents += amount_cents
+        return True, remaining
+
+    def _release_budget(self, amount_cents: int) -> None:
+        """Give a reservation back (local and shared).  Call with ``self._lock`` held."""
+        self._spent_cents -= amount_cents
+        if self._shared_budget is not None:
+            self._shared_budget.release(amount_cents)
+
+    def _replace_entry(self, stripe_pi_id: str, **changes: Any) -> None:
+        """Replace fields on the ledger entry for a PaymentIntent.  Call with the lock held."""
+        for idx, entry in enumerate(self._ledger):
+            if entry.stripe_payment_intent_id == stripe_pi_id:
+                self._ledger[idx] = replace(entry, **changes)
+                return
 
     @staticmethod
     def _stable_idempotency_key(base: str, index: int) -> str:
@@ -432,7 +544,7 @@ class ReferenceAgent:
         Formula: cap/2 + random(0, cap/2), where cap = min(MAX_DELAY, BASE * 2^attempt).
         Half of each delay is guaranteed, so waits never collapse to ~0 by chance.
         """
-        cap = min(_MAX_DELAY_S, _BASE_DELAY_S * (2**attempt))
+        cap = min(_MAX_DELAY_S, _BASE_DELAY_S * (2.0**attempt))
         return cap / 2 + (cap / 2) * random.random()  # noqa: S311
 
     @staticmethod

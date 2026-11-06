@@ -1,24 +1,24 @@
 """Invariants — post-run correctness checks for payment safety properties.
 
-Each invariant is a pure function that receives the full event log from a
-scenario run and returns a pass/fail verdict with a human-readable explanation.
+Each invariant receives the recorded requests, webhook deliveries and the
+agent's ledger from a scenario run and returns a list of violations.
 
-Invariant catalog
------------------
 ========  ===================================================================
 ID        Description
 ========  ===================================================================
-I1        Every mutating Stripe API call carries an idempotency key.
-I2        Agent checks remaining budget before initiating any charge.
-I3        Budget decrement is atomic (compare-and-swap, not read-then-write).
-I4        Total captured amount ≤ authorised budget.
-I5        Every PaymentIntent reaches a terminal state within the timeout.
-I6        Duplicate webhook events do not cause duplicate side-effects.
-I7        Agent does not assume webhook delivery order.
-I8        Stale webhook replays beyond the tolerance window are discarded.
-I9        No duplicate PaymentIntents for the same logical operation.
-I10       Refund amount ≤ captured amount for every PaymentIntent.
-I11       Budget mutations are serialised (no concurrent modifications).
+I1        At most one successful charge per intent.
+I2        Total captured amount within budget.
+I3        Every charge has an approved intent in the ledger.
+I4        Idempotency key reuse returns the original response.
+I5        Idempotency key mismatch returns a 400 error.
+I6        Webhook events processed at most once.
+I7        Event processing is order-independent.
+I8        Webhook signatures (and timestamps) verified before processing.
+I9        Abort cleans up (no dangling authorizations).
+I10       Rate-limit retries use exponential backoff.
+I11       Ledger reconciles with Stripe records.
+I12       Ledger records the captured amount, not the authorized amount.
+I13       Cumulative refunds never exceed the captured amount.
 ========  ===================================================================
 """
 

@@ -10,34 +10,16 @@ from __future__ import annotations
 
 import fnmatch
 import random
-from typing import Any
 
+from agentpay_harness.faults.actions import FaultAction, FaultActionType
 from agentpay_harness.types import RequestRecord
-
-# Lazy import to break circular dependency at module level.
-# FaultAction and FaultActionType are imported at call time.
-
-
-def _action_type() -> type:
-    """Deferred import of FaultActionType to avoid circular imports."""
-    from agentpay_harness.faults.engine import FaultActionType
-
-    return FaultActionType  # type: ignore[return-value]
-
-
-def _action_cls() -> type:
-    """Deferred import of FaultAction to avoid circular imports."""
-    from agentpay_harness.faults.engine import FaultAction
-
-    return FaultAction  # type: ignore[return-value]
-
 
 # ======================================================================
 # Transport fault factories
 # ======================================================================
 
 
-def drop_response_action(request_record: RequestRecord | None = None) -> Any:
+def drop_response_action(request_record: RequestRecord | None = None) -> FaultAction:
     """Return a :class:`FaultAction` simulating a dropped/timed-out response.
 
     Parameters
@@ -45,8 +27,6 @@ def drop_response_action(request_record: RequestRecord | None = None) -> Any:
     request_record:
         Optional request record for context (unused but kept for API symmetry).
     """
-    from agentpay_harness.faults.actions import FaultAction, FaultActionType
-
     return FaultAction(
         action_type=FaultActionType.DROP_RESPONSE,
         response_override={
@@ -63,13 +43,11 @@ def drop_response_action(request_record: RequestRecord | None = None) -> Any:
 drop_response = drop_response_action
 
 
-def inject_429() -> Any:
+def inject_429() -> FaultAction:
     """Return a :class:`FaultAction` simulating a Stripe 429 rate-limit response.
 
     Includes a ``Retry-After`` header value in the response override.
     """
-    from agentpay_harness.faults.actions import FaultAction, FaultActionType
-
     return FaultAction(
         action_type=FaultActionType.INJECT_429,
         response_override={
@@ -85,7 +63,7 @@ def inject_429() -> Any:
     )
 
 
-def inject_5xx(seed: random.Random) -> Any:
+def inject_5xx(seed: random.Random) -> FaultAction:
     """Return a :class:`FaultAction` simulating a 500 or 503 server error.
 
     Parameters
@@ -93,8 +71,6 @@ def inject_5xx(seed: random.Random) -> Any:
     seed:
         A :class:`random.Random` instance used to choose between 500 and 503.
     """
-    from agentpay_harness.faults.actions import FaultAction, FaultActionType
-
     status = seed.choice([500, 503])
     message = (
         "Internal server error (fault injection)"
@@ -114,7 +90,7 @@ def inject_5xx(seed: random.Random) -> Any:
     )
 
 
-def delay_response(ms: int) -> Any:
+def delay_response(ms: int) -> FaultAction:
     """Return a :class:`FaultAction` that adds an artificial delay.
 
     Parameters
@@ -123,8 +99,6 @@ def delay_response(ms: int) -> Any:
         Delay in milliseconds.  The client will ``time.sleep`` for this
         duration before making the real API call.
     """
-    from agentpay_harness.faults.actions import FaultAction, FaultActionType
-
     return FaultAction(
         action_type=FaultActionType.DELAY,
         delay_ms=ms,
@@ -132,14 +106,12 @@ def delay_response(ms: int) -> Any:
     )
 
 
-def duplicate_request() -> Any:
+def duplicate_request() -> FaultAction:
     """Return a :class:`FaultAction` flagging that the request should be sent twice.
 
     The client will execute the real Stripe API call twice, recording both
     responses, but only returning the first to the caller.
     """
-    from agentpay_harness.faults.actions import FaultAction, FaultActionType
-
     return FaultAction(
         action_type=FaultActionType.DUPLICATE,
         fault_description="Duplicate request — sent twice",

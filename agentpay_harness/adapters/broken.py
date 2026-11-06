@@ -150,6 +150,7 @@ class BrokenBudgetAgent(ReferenceAgent):
         """Split task into 3 concurrent intents to trigger TOCTOU race."""
         self._budget_cents = task.budget_cents
         self._spent_cents = 0
+        self._shared_budget = task.metadata.get("budget_store")
         chunk = 7500  # 3 * $75 = $225 > $200 budget
         return [
             Intent(
@@ -169,7 +170,14 @@ class BrokenBudgetAgent(ReferenceAgent):
         )
 
         # BUG: Read budget state WITHOUT holding the lock (breaks I2).
-        remaining = self._budget_cents - self._spent_cents
+        shared = self._shared_budget
+        if shared is not None:
+            # Read-modify-write on the shared budget: another agent can read the
+            # same balance between our read and our write (lost update).
+            spent = shared.read()
+            remaining = shared.total_cents - spent
+        else:
+            remaining = self._budget_cents - self._spent_cents
         if intent.amount_cents > remaining:
             return PaymentResult(
                 intent_id=intent.intent_id,
@@ -183,6 +191,8 @@ class BrokenBudgetAgent(ReferenceAgent):
         time.sleep(0.02)
 
         # BUG: Also update spent WITHOUT the lock.
+        if shared is not None:
+            shared.write(spent + intent.amount_cents)
         self._spent_cents += intent.amount_cents
 
         with self._lock:
@@ -454,24 +464,24 @@ class BrokenWebhookDedupeAgent(ReferenceAgent):
                 self._ledger.append(entry)
         elif event_type == "payment_intent.payment_failed":
             with self._lock:
-                entry = self._find_ledger_by_stripe_id(stripe_pi_id)
-                if entry is not None:
+                found = self._find_ledger_by_stripe_id(stripe_pi_id)
+                if found is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.FAILED)
-                    self._spent_cents -= entry.amount_cents
+                    self._spent_cents -= found.amount_cents
         elif event_type == "payment_intent.canceled":
             with self._lock:
-                entry = self._find_ledger_by_stripe_id(stripe_pi_id)
-                if entry is not None:
+                found = self._find_ledger_by_stripe_id(stripe_pi_id)
+                if found is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.VOIDED)
-                    self._spent_cents -= entry.amount_cents
+                    self._spent_cents -= found.amount_cents
         elif event_type == "charge.refunded":
             with self._lock:
                 charge_pi_id = pi_data.get("payment_intent", "")
                 if charge_pi_id:
-                    entry = self._find_ledger_by_stripe_id(charge_pi_id)
-                    if entry is not None:
+                    found = self._find_ledger_by_stripe_id(charge_pi_id)
+                    if found is not None:
                         self._update_ledger_by_stripe_id(charge_pi_id, LedgerEntryStatus.REFUNDED)
-                        self._spent_cents -= entry.amount_cents
+                        self._spent_cents -= found.amount_cents
 
 
 # ---------------------------------------------------------------------------
@@ -537,16 +547,16 @@ class BrokenWebhookOrderAgent(ReferenceAgent):
                 self._ledger.append(entry)
         elif event_type == "payment_intent.payment_failed":
             with self._lock:
-                entry = self._find_ledger_by_stripe_id(stripe_pi_id)
-                if entry is not None:
+                found = self._find_ledger_by_stripe_id(stripe_pi_id)
+                if found is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.FAILED)
-                    self._spent_cents -= entry.amount_cents
+                    self._spent_cents -= found.amount_cents
         elif event_type == "payment_intent.canceled":
             with self._lock:
-                entry = self._find_ledger_by_stripe_id(stripe_pi_id)
-                if entry is not None:
+                found = self._find_ledger_by_stripe_id(stripe_pi_id)
+                if found is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.VOIDED)
-                    self._spent_cents -= entry.amount_cents
+                    self._spent_cents -= found.amount_cents
 
 
 # ---------------------------------------------------------------------------
@@ -594,24 +604,24 @@ class BrokenWebhookVerifyAgent(ReferenceAgent):
                 self._ledger.append(entry)
         elif event_type == "payment_intent.payment_failed":
             with self._lock:
-                entry = self._find_ledger_by_stripe_id(stripe_pi_id)
-                if entry is not None:
+                found = self._find_ledger_by_stripe_id(stripe_pi_id)
+                if found is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.FAILED)
-                    self._spent_cents -= entry.amount_cents
+                    self._spent_cents -= found.amount_cents
         elif event_type == "payment_intent.canceled":
             with self._lock:
-                entry = self._find_ledger_by_stripe_id(stripe_pi_id)
-                if entry is not None:
+                found = self._find_ledger_by_stripe_id(stripe_pi_id)
+                if found is not None:
                     self._update_ledger_by_stripe_id(stripe_pi_id, LedgerEntryStatus.VOIDED)
-                    self._spent_cents -= entry.amount_cents
+                    self._spent_cents -= found.amount_cents
         elif event_type == "charge.refunded":
             with self._lock:
                 charge_pi_id = pi_data.get("payment_intent", "")
                 if charge_pi_id:
-                    entry = self._find_ledger_by_stripe_id(charge_pi_id)
-                    if entry is not None:
+                    found = self._find_ledger_by_stripe_id(charge_pi_id)
+                    if found is not None:
                         self._update_ledger_by_stripe_id(charge_pi_id, LedgerEntryStatus.REFUNDED)
-                        self._spent_cents -= entry.amount_cents
+                        self._spent_cents -= found.amount_cents
 
 
 # ---------------------------------------------------------------------------
@@ -655,3 +665,65 @@ class BrokenBackoffAgent(ReferenceAgent):
         """Return zero delay — no backoff at all."""
         # BUG: No backoff, no jitter (breaks I10).
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# I12 — Broken capture accounting (F6)
+# ---------------------------------------------------------------------------
+
+
+class BrokenCaptureAgent(ReferenceAgent):
+    """Books the *authorized* amount as captured, ignoring ``amount_received``.
+
+    Breaks:
+        I12 — The ledger must record what Stripe actually captured.
+    """
+
+    def capture_authorized(self, client: StripeClient) -> None:
+        with self._lock:
+            pending = [
+                e
+                for e in self._ledger
+                if e.status is LedgerEntryStatus.PENDING and e.stripe_payment_intent_id
+            ]
+        for entry in pending:
+            pi_id = str(entry.stripe_payment_intent_id)
+            client.capture_payment_intent(pi_id, idempotency_key=f"cap_{pi_id}")
+            with self._lock:
+                # BUG: assumes the full authorization was captured.
+                self._replace_entry(pi_id, status=LedgerEntryStatus.CAPTURED)
+
+
+# ---------------------------------------------------------------------------
+# I13 — Broken refund accounting (F7)
+# ---------------------------------------------------------------------------
+
+
+class BrokenRefundAgent(ReferenceAgent):
+    """Refunds the authorized amount and records it even when Stripe refuses.
+
+    Breaks:
+        I13 — Refunds (in Stripe and in the ledger) never exceed what was captured.
+
+    Captures correctly (inherited), so only the refund path is wrong.
+    """
+
+    def refund_captured(self, client: StripeClient) -> None:
+        with self._lock:
+            captured = [
+                e
+                for e in self._ledger
+                if e.status is LedgerEntryStatus.CAPTURED and e.stripe_payment_intent_id
+            ]
+        for entry in captured:
+            pi_id = str(entry.stripe_payment_intent_id)
+            authorized = int(entry.metadata.get("authorized_cents", entry.amount_cents))
+            # BUG: refunds what was authorized, not what was captured...
+            client.create_refund(pi_id, amount=authorized, idempotency_key=f"ref_{pi_id}")
+            with self._lock:
+                # ...and books it without checking whether Stripe accepted it.
+                self._replace_entry(
+                    pi_id,
+                    status=LedgerEntryStatus.REFUNDED,
+                    metadata=dict(entry.metadata, refunded_cents=authorized),
+                )

@@ -148,6 +148,7 @@ def _run_one(
         stripe_key=stripe_key,
         stripe_base_url=base_url,
         force_offline=force_offline,
+        agent_factory=agent_cls,
     )
 
     result = driver.run()
@@ -222,7 +223,7 @@ def invariants_group() -> None:
 
 @invariants_group.command("list")
 def invariants_list_command() -> None:
-    """List all supported invariants (I1-I11) and what violates them."""
+    """List all supported invariants (I1-I13) and what violates them."""
     _print_invariants()
 
 
@@ -234,7 +235,7 @@ def list_invariants_command() -> None:
 
 def _print_invariants() -> None:
     console = Console()
-    table = Table(title="[bold]agentpay-harness Invariants (I1-I11)[/bold]", show_header=True)
+    table = Table(title="[bold]agentpay-harness Invariants (I1-I13)[/bold]", show_header=True)
     table.add_column("ID", style="bold cyan", width=6)
     table.add_column("Invariant", style="bold white", width=36)
     table.add_column("Violated When", style="yellow")
@@ -278,6 +279,16 @@ def _print_invariants() -> None:
             "I11",
             "Ledger reconciles exactly with Stripe",
             "Partial-failure amnesia / untracked funds",
+        ),
+        (
+            "I12",
+            "Ledger books captured, not authorized",
+            "Ignoring amount_received after a partial capture",
+        ),
+        (
+            "I13",
+            "Refunds never exceed capture",
+            "Refunding the authorization / booking a refused refund",
         ),
     ]
 

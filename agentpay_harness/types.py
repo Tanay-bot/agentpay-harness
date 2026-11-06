@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import enum
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from uuid import uuid4
@@ -54,6 +54,26 @@ class FaultType(enum.Enum):
     CLOCK_SKEW = "clock_skew"
     FORGED_WEBHOOK = "forged_webhook"
     ASYNC_PAYMENT_FAILURE = "async_payment_failure"
+    PARTIAL_CAPTURE = "partial_capture"
+    INTERLEAVE = "interleave"
+
+
+#: The only currency the harness supports.  Budgets, ledgers and invariants all
+#: assume it; anything else is rejected loudly rather than mis-summed.
+SUPPORTED_CURRENCY = "usd"
+
+
+class UnsupportedCurrencyError(ValueError):
+    """Raised when a scenario or agent uses a currency other than USD."""
+
+
+def require_usd(currency: str | None, where: str) -> None:
+    """Raise :class:`UnsupportedCurrencyError` unless ``currency`` is USD."""
+    if (currency or "").lower() != SUPPORTED_CURRENCY:
+        raise UnsupportedCurrencyError(
+            f"{where}: currency {currency!r} is not supported. agentpay-harness is "
+            f"USD-only; budgets and ledgers are summed in USD cents."
+        )
 
 
 class Severity(enum.Enum):
@@ -71,7 +91,7 @@ class Severity(enum.Enum):
 
 def _utcnow() -> datetime:
     """Return the current UTC datetime (timezone-aware)."""
-    return datetime.now(tz=UTC)
+    return datetime.now(tz=timezone.utc)
 
 
 def _new_id() -> str:
@@ -229,7 +249,7 @@ class StripeEvent:
     @property
     def timestamp(self) -> datetime:
         """Return datetime representation of unix created timestamp."""
-        return datetime.fromtimestamp(self.created, tz=UTC)
+        return datetime.fromtimestamp(self.created, tz=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +268,11 @@ class FaultConfig:
         occurrence: Which occurrence to inject on (1-indexed).
         times: How many times to inject.
         ms: Milliseconds parameter (e.g. delay duration).
-        window: Window size in seconds (e.g. for reordering).
+        window: Number of deliveries shuffled together (for reordering).
         delay_s: Delay in seconds (e.g. for replay).
+        percent: Percentage of the authorized amount to capture (partial_capture).
+        skew_s: Seconds to shift webhook signature timestamps by (clock_skew).
+        schedule: Agent indices taking turns at budget checkpoints (interleave).
     """
 
     type: FaultType
@@ -260,6 +283,9 @@ class FaultConfig:
     ms: int | None = None
     window: int | None = None
     delay_s: int | None = None
+    percent: int | None = None
+    skew_s: int | None = None
+    schedule: list[int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +302,13 @@ class ScenarioConfig:
         concurrency: Number of concurrent agent executions.
         capture_method: ``automatic`` or ``manual`` (authorize now, capture later).
         abort: If true, the driver calls the agent's ``abort(client)`` after paying.
+        settle: If true, the driver calls ``capture_authorized(client)`` (manual capture).
+        refund: If true, the driver then calls ``refund_captured(client)``.
+        currency: Must be ``usd``; present so non-USD scenarios fail loudly.
+        agents: Number of agent instances sharing one budget.
+        webhook_source: ``synthetic`` (harness-generated) or ``stripe_cli`` (real events).
+        cli_triggers: ``stripe trigger`` event names, for ``webhook_source: stripe_cli``.
+        cli_timeout_s: How long to wait for real events to arrive.
     """
 
     name: str
@@ -287,12 +320,28 @@ class ScenarioConfig:
     concurrency: int = 1
     capture_method: str = "automatic"
     abort: bool = False
+    settle: bool = False
+    refund: bool = False
+    currency: str = SUPPORTED_CURRENCY
+    agents: int = 1
+    webhook_source: str = "synthetic"
+    cli_triggers: list[str] = field(default_factory=list)
+    cli_timeout_s: int = 60
 
     def __post_init__(self) -> None:
+        require_usd(self.currency, f"scenario {self.name!r}")
         if self.capture_method not in ("automatic", "manual"):
             raise ValueError(
                 f"capture_method must be 'automatic' or 'manual', got {self.capture_method!r}"
             )
+        if self.webhook_source not in ("synthetic", "stripe_cli"):
+            raise ValueError(
+                f"webhook_source must be 'synthetic' or 'stripe_cli', got {self.webhook_source!r}"
+            )
+        if self.agents < 1:
+            raise ValueError(f"agents must be >= 1, got {self.agents}")
+        if self.refund and not self.settle and self.capture_method == "manual":
+            raise ValueError("refund: true with manual capture also needs settle: true")
         if not self.name:
             raise ValueError("scenario name must not be empty")
         if self.budget_usd <= 0:

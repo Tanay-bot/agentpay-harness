@@ -13,7 +13,6 @@ NON-NEGOTIABLE SAFETY RULES:
 from __future__ import annotations
 
 import os
-from typing import Any
 
 
 class LiveKeyError(ValueError):
@@ -91,7 +90,7 @@ def load_stripe_key_from_env(env_var: str = "STRIPE_TEST_SECRET_KEY") -> str:
     return key.strip()
 
 
-def validate_no_live_mode(api_response: dict[str, Any]) -> None:
+def validate_no_live_mode(api_response: object) -> None:
     """Ensure an API response dictionary does not indicate live mode.
 
     Parameters

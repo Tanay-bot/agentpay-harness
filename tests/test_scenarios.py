@@ -6,7 +6,7 @@ and the ReferenceAgent must pass every bundled scenario.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -105,7 +105,7 @@ def _delivery(event_id: str, valid: bool) -> WebhookDelivery:
         event_type="payment_intent.succeeded",
         signature_valid=valid,
         fault_description="test",
-        timestamp=datetime.now(tz=UTC),
+        timestamp=datetime.now(tz=timezone.utc),
     )
 
 
@@ -156,7 +156,7 @@ def test_i8_ignores_event_redelivered_with_valid_signature(session: SessionConte
 
 def _requests(gaps_s: list[float], statuses: list[int]) -> EventRecorder:
     recorder = EventRecorder()
-    t = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
+    t = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)
     times = [t]
     for g in gaps_s:
         times.append(times[-1] + timedelta(seconds=g))

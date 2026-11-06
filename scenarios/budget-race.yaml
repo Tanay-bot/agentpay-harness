@@ -1,0 +1,20 @@
+# =============================================================================
+# Scenario: budget-race
+# =============================================================================
+# Two agent instances share one $100 budget and each wants to spend $75.
+# The interleave fault fixes the order in which they pass budget checkpoints:
+# agent 0, agent 1, agent 0, agent 1.  With a read-then-write budget check,
+# both read "$0 spent" before either writes, and both pay: $150 on $100.
+# An atomic check-and-reserve lets exactly one through.
+# =============================================================================
+
+name: budget-race
+budget_usd: 100
+task: "buy one API credit pack at $75"
+agents: 2
+faults:
+  - type: interleave
+    schedule: [0, 1, 0, 1]
+seed: 42
+assert:
+  - I2   # Total captured amount within budget

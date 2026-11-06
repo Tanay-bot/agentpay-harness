@@ -1,0 +1,22 @@
+# =============================================================================
+# Scenario: clock-skew
+# =============================================================================
+# The sender's clock is off.  payment_intent.created arrives signed 2 minutes
+# in the past (inside Stripe's 5-minute tolerance: must be accepted), while
+# payment_intent.succeeded arrives signed 15 minutes in the future (outside
+# the tolerance: must be rejected, exactly like a stale replay).
+# =============================================================================
+
+name: clock-skew
+budget_usd: 100
+task: "buy one API credit pack at $50"
+faults:
+  - type: clock_skew
+    event: payment_intent.created
+    skew_s: -120
+  - type: clock_skew
+    event: payment_intent.succeeded
+    skew_s: 900
+seed: 42
+assert:
+  - I8   # Webhook signatures (and timestamps) verified before processing

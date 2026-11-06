@@ -1,0 +1,30 @@
+# =============================================================================
+# Scenario: stripe-cli-webhooks  (integration — needs the Stripe CLI + a test key)
+# =============================================================================
+# Genuine Stripe test-mode events instead of synthetic ones.  The harness runs
+# `stripe listen --forward-to <local receiver>`, fires `stripe trigger` for
+# each event below, and delivers the real bodies and Stripe-Signature headers
+# to the agent.  Each is also delivered a second time (duplicate) and a
+# forged copy is sent, so dedupe and signature checks run against Stripe's
+# own signing.
+#
+#   STRIPE_TEST_SECRET_KEY=sk_test_... agentpay run scenarios/integration/stripe-cli-webhooks.yaml
+# =============================================================================
+
+name: stripe-cli-webhooks
+budget_usd: 100
+task: "observe Stripe test-mode webhooks"
+webhook_source: stripe_cli
+cli_triggers:
+  - payment_intent.succeeded
+cli_timeout_s: 90
+faults:
+  - type: duplicate_webhook
+    event: payment_intent.succeeded
+    times: 2
+  - type: forged_webhook
+    event: payment_intent.succeeded
+seed: 42
+assert:
+  - I6   # Webhook events processed at most once
+  - I8   # Webhook signatures verified before processing

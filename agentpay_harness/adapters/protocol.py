@@ -51,6 +51,7 @@ class StripeClient(Protocol):
         payment_intent_id: str,
         *,
         idempotency_key: str | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Capture a previously authorized PaymentIntent.
 
@@ -61,6 +62,16 @@ class StripeClient(Protocol):
         Returns:
             The captured PaymentIntent object as a dict.
         """
+        ...
+
+    def create_refund(
+        self,
+        payment_intent_id: str,
+        *,
+        amount: int | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Refund a captured PaymentIntent (all of it when ``amount`` is None)."""
         ...
 
     def cancel_payment_intent(self, payment_intent_id: str) -> dict[str, Any]:
@@ -130,6 +141,16 @@ class AgentUnderTest(Protocol):
     2. ``pay``  — execute a single intent via the provided Stripe client.
     3. ``on_event`` — handle an incoming webhook event.
     4. ``ledger`` — return the agent's current view of all payments.
+
+    Optional methods, called only by scenarios that ask for them:
+
+    - ``abort(client)`` — ``abort: true``: release everything still held.
+    - ``capture_authorized(client)`` — ``settle: true``: capture authorizations.
+    - ``refund_captured(client)`` — ``refund: true``: refund captured payments.
+
+    ``task.metadata`` may carry ``budget_store`` (a shared
+    :class:`~agentpay_harness.budget.SharedBudget` when ``agents > 1``) and
+    ``webhook_secret`` (the signing secret, for ``webhook_source: stripe_cli``).
     """
 
     def plan(self, task: Task) -> list[Intent]:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from agentpay_harness.adapters.protocol import AgentUnderTest
 from agentpay_harness.types import InvariantViolation, ScenarioConfig
@@ -65,14 +65,8 @@ def shrink(
         while i < len(current_faults):
             # Candidate: remove fault at index i
             candidate_faults = current_faults[:i] + current_faults[i + 1 :]
-            candidate_scenario = ScenarioConfig(
-                name=f"{scenario.name}-shrunk",
-                budget_usd=scenario.budget_usd,
-                task=scenario.task,
-                seed=scenario.seed,
-                faults=candidate_faults,
-                assertions=scenario.assertions,
-                concurrency=scenario.concurrency,
+            candidate_scenario = replace(
+                scenario, name=f"{scenario.name}-shrunk", faults=candidate_faults
             )
 
             steps += 1
@@ -95,15 +89,7 @@ def shrink(
             else:
                 i += 1
 
-    minimal_scenario = ScenarioConfig(
-        name=f"{scenario.name}-minimal",
-        budget_usd=scenario.budget_usd,
-        task=scenario.task,
-        seed=scenario.seed,
-        faults=current_faults,
-        assertions=scenario.assertions,
-        concurrency=scenario.concurrency,
-    )
+    minimal_scenario = replace(scenario, name=f"{scenario.name}-minimal", faults=current_faults)
 
     return ShrinkResult(
         original_fault_count=original_count,

@@ -23,6 +23,7 @@ class FaultActionType(enum.Enum):
     DELAY = "delay"
     DUPLICATE = "duplicate"
     ASYNC_FAILURE = "async_failure"
+    PARTIAL_CAPTURE = "partial_capture"
 
 
 @dataclass(frozen=True, slots=True)

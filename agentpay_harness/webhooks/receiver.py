@@ -11,9 +11,10 @@ import logging
 import random
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime, timezone
+from fnmatch import fnmatch
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from typing import Any
@@ -51,11 +52,15 @@ class WebhookReceiver:
         recorder: EventRecorder | None = None,
         signing_secret: str = HARNESS_WEBHOOK_SECRET,
         verify_signatures: bool = True,
+        raw_handler: Callable[[bytes, str], None] | None = None,
     ) -> None:
         self.event_handler = event_handler
         self.recorder = recorder
         self.signing_secret = signing_secret
         self.verify_signatures = verify_signatures
+        #: When set, every POST body and its Stripe-Signature header are handed
+        #: over untouched (no verification, no parsing) and answered with 200.
+        self.raw_handler = raw_handler
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._port: int = 0
@@ -81,6 +86,13 @@ class WebhookReceiver:
                 content_len = int(self.headers.get("Content-Length", 0))
                 body = self.rfile.read(content_len)
                 sig_header = self.headers.get("Stripe-Signature", "")
+
+                if receiver_self.raw_handler is not None:
+                    receiver_self.raw_handler(body, sig_header)
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b'{"received": true}')
+                    return
 
                 if receiver_self.verify_signatures:
                     if not verify_signature(body, sig_header, receiver_self.signing_secret):
@@ -164,6 +176,7 @@ class WebhookDeliverySystem:
         reorder_window: int = 0,
         seed: int = 0,
         signature_tolerance_s: int = 300,
+        clock_skews: Sequence[tuple[str | None, int]] = (),
     ) -> None:
         self.target_callback = target_callback
         self.fault_engine = fault_engine
@@ -171,6 +184,9 @@ class WebhookDeliverySystem:
         self.signing_secret = signing_secret
         self.reorder_window = reorder_window
         self.signature_tolerance_s = signature_tolerance_s
+        #: (event-type pattern or None for all, seconds) — the sender's clock is
+        #: this far ahead (+) or behind (-) of the receiver's.
+        self.clock_skews = list(clock_skews)
         self._rng = random.Random(seed)  # noqa: S311 - deterministic shuffling, not crypto
         self._lock = threading.Lock()
         self._queue: list[StripeEvent] = []
@@ -256,8 +272,24 @@ class WebhookDeliverySystem:
             },
             sort_keys=True,
         ).encode("utf-8")
+        skew_s = sum(
+            s for pattern, s in self.clock_skews if pattern is None or fnmatch(event.type, pattern)
+        )
+        if skew_s:
+            description = f"{description}; sender clock skewed {skew_s:+d}s"
         now = int(time.time())
-        header = generate_test_signature(payload, secret, timestamp=now - age_s)
+        header = generate_test_signature(payload, secret, timestamp=now - age_s + skew_s)
+        self._dispatch(event, payload, header, description)
+
+    def send_signed(self, event: StripeEvent, secret: str, description: str) -> None:
+        """Sign ``event`` with ``secret`` (e.g. a forger's) and deliver it now."""
+        self._send(event, 0, secret, description)
+
+    def deliver_genuine(self, event: StripeEvent, payload: bytes, signature_header: str) -> None:
+        """Deliver a real Stripe event with its original body and signature, untouched."""
+        self._dispatch(event, payload, signature_header, "Genuine Stripe delivery")
+
+    def _dispatch(self, event: StripeEvent, payload: bytes, header: str, description: str) -> None:
         signature_valid = verify_signature(
             payload, header, self.signing_secret, tolerance=self.signature_tolerance_s
         )
@@ -270,7 +302,7 @@ class WebhookDeliverySystem:
                     event_type=event.type,
                     signature_valid=signature_valid,
                     fault_description=description,
-                    timestamp=datetime.now(tz=UTC),
+                    timestamp=datetime.now(tz=timezone.utc),
                 )
             )
             self.recorder.record_event(signed)

@@ -10,10 +10,12 @@ from __future__ import annotations
 import logging
 from typing import Protocol, runtime_checkable
 
+from agentpay_harness.stripeio.recorder import EventRecorder
 from agentpay_harness.types import (
     InvariantViolation,
     LedgerEntry,
     SessionContext,
+    Severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -38,7 +40,7 @@ class InvariantChecker(Protocol):
 
     def check(
         self,
-        recorder: object,
+        recorder: EventRecorder,
         ledger: list[LedgerEntry],
         session: SessionContext,
     ) -> list[InvariantViolation]:
@@ -115,7 +117,7 @@ class InvariantRegistry:
     def check_all(
         self,
         ids: list[str],
-        recorder: object,
+        recorder: EventRecorder,
         ledger: list[LedgerEntry],
         session: SessionContext,
     ) -> list[InvariantViolation]:
@@ -148,7 +150,7 @@ class InvariantRegistry:
                     InvariantViolation(
                         invariant_id=inv_id,
                         description=f"Invariant {inv_id} raised an exception during check",
-                        severity=_severity_module().Severity.ERROR,
+                        severity=Severity.ERROR,
                         evidence={"error": "see logs for traceback"},
                     )
                 )
@@ -157,18 +159,11 @@ class InvariantRegistry:
     def __len__(self) -> int:
         return len(self._checkers)
 
-    def __contains__(self, invariant_id: str) -> bool:
+    def __contains__(self, invariant_id: object) -> bool:
         return invariant_id in self._checkers
 
     def __repr__(self) -> str:
         return f"InvariantRegistry(ids={sorted(self._checkers)})"
-
-
-def _severity_module() -> type:
-    """Lazy import to avoid circular dependency at module scope."""
-    from agentpay_harness import types as _t
-
-    return _t  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +174,7 @@ _DEFAULT_REGISTRY: InvariantRegistry | None = None
 
 
 def _build_default_registry() -> InvariantRegistry:
-    """Build and return a registry with all I1-I11 checks."""
+    """Build and return a registry with all I1-I13 checks."""
     from agentpay_harness.invariants.checks import (
         AbortCleansUp,
         AtMostOneChargePerIntent,
@@ -188,7 +183,9 @@ def _build_default_registry() -> InvariantRegistry:
         IdempotencyKeyMismatchIsError,
         IdempotencyKeyReturnsOriginal,
         LedgerReconcilesWithStripe,
+        LedgerRecordsCapturedAmount,
         RateLimitBackoff,
+        RefundsNeverExceedCapture,
         TotalCapturedWithinBudget,
         WebhookEventProcessedAtMostOnce,
         WebhookSignaturesVerified,
@@ -207,6 +204,8 @@ def _build_default_registry() -> InvariantRegistry:
         AbortCleansUp,
         RateLimitBackoff,
         LedgerReconcilesWithStripe,
+        LedgerRecordsCapturedAmount,
+        RefundsNeverExceedCapture,
     ):
         registry.register(cls())
     return registry

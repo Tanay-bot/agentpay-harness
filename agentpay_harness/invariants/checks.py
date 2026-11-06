@@ -846,3 +846,170 @@ class LedgerReconcilesWithStripe:
             )
 
         return violations
+
+
+# ---------------------------------------------------------------------------
+# Helpers for capture / refund invariants
+# ---------------------------------------------------------------------------
+
+
+def _ok_record(rec: RequestRecord) -> bool:
+    return (
+        rec.response_status is not None
+        and 200 <= rec.response_status < 300
+        and rec.response_body is not None
+    )
+
+
+def _latest_payment_intents(recorder: EventRecorder) -> dict[str, dict[str, Any]]:
+    """Latest successful response body for every PaymentIntent, in request order."""
+    latest: dict[str, dict[str, Any]] = {}
+    for rec in recorder.requests:
+        body = rec.response_body
+        if _ok_record(rec) and body and body.get("object") == "payment_intent" and body.get("id"):
+            latest[str(body["id"])] = body
+    return latest
+
+
+def _ledger_refunded(entry: LedgerEntry) -> int:
+    if "refunded_cents" in entry.metadata:
+        return int(entry.metadata["refunded_cents"])
+    return entry.amount_cents if entry.status is LedgerEntryStatus.REFUNDED else 0
+
+
+# ---------------------------------------------------------------------------
+# I12: Ledger Records Captured Amount
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class LedgerRecordsCapturedAmount:
+    """I12 — For a captured payment, the ledger holds ``amount_received``, not the authorization.
+
+    Stripe can capture less than was authorized (partial capture).  An agent
+    that books the authorized amount overstates spend and later over-refunds.
+    """
+
+    invariant_id: str = "I12"
+    description: str = "Ledger records the captured amount, not the authorized amount"
+
+    def check(
+        self,
+        recorder: EventRecorder,
+        ledger: list[LedgerEntry],
+        session: SessionContext,
+    ) -> list[InvariantViolation]:
+        violations: list[InvariantViolation] = []
+        latest = _latest_payment_intents(recorder)
+        for entry in ledger:
+            pi_id = entry.stripe_payment_intent_id
+            if not pi_id or pi_id not in latest:
+                continue
+            if entry.status not in (LedgerEntryStatus.CAPTURED, LedgerEntryStatus.REFUNDED):
+                continue
+            pi = latest[pi_id]
+            if pi.get("status") != "succeeded" or pi.get("amount_received") is None:
+                continue
+            received = int(pi["amount_received"])
+            if entry.amount_cents != received:
+                violations.append(
+                    InvariantViolation(
+                        invariant_id=self.invariant_id,
+                        description=(
+                            f"Ledger books {entry.amount_cents} cents for PI {pi_id}, "
+                            f"but Stripe captured {received} cents "
+                            f"(authorized {pi.get('amount')})"
+                        ),
+                        severity=Severity.CRITICAL,
+                        evidence={
+                            "payment_intent_id": pi_id,
+                            "ledger_amount_cents": entry.amount_cents,
+                            "amount_received": received,
+                            "authorized_amount": pi.get("amount"),
+                        },
+                    )
+                )
+        return violations
+
+
+# ---------------------------------------------------------------------------
+# I13: Refunds Never Exceed Capture
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class RefundsNeverExceedCapture:
+    """I13 — Cumulative refunds for a payment never exceed what was captured.
+
+    Checked on both sides: the refunds Stripe confirmed (summed across every
+    successful ``POST /v1/refunds``) and the refunds the agent's ledger claims.
+    The ledger may also never claim more than Stripe actually refunded.
+    """
+
+    invariant_id: str = "I13"
+    description: str = "Cumulative refunds never exceed the captured amount"
+
+    def check(
+        self,
+        recorder: EventRecorder,
+        ledger: list[LedgerEntry],
+        session: SessionContext,
+    ) -> list[InvariantViolation]:
+        violations: list[InvariantViolation] = []
+        latest = _latest_payment_intents(recorder)
+
+        captured: dict[str, int] = {}
+        for pi_id, pi in latest.items():
+            if pi.get("status") == "succeeded":
+                captured[pi_id] = int(pi.get("amount_received") or pi.get("amount") or 0)
+
+        confirmed: dict[str, int] = defaultdict(int)
+        seen_refunds: set[str] = set()
+        for rec in recorder.requests:
+            body = rec.response_body
+            if not (_ok_record(rec) and body and body.get("object") == "refund"):
+                continue
+            refund_id = str(body.get("id"))
+            if refund_id in seen_refunds:  # idempotent replay of the same refund
+                continue
+            seen_refunds.add(refund_id)
+            confirmed[str(body.get("payment_intent"))] += int(body.get("amount") or 0)
+
+        def _flag(pi_id: str, what: str, amount: int, limit: int, limit_name: str) -> None:
+            violations.append(
+                InvariantViolation(
+                    invariant_id=self.invariant_id,
+                    description=(
+                        f"{what} for PI {pi_id} total {amount} cents, "
+                        f"more than {limit_name} ({limit} cents)"
+                    ),
+                    severity=Severity.CRITICAL,
+                    evidence={
+                        "payment_intent_id": pi_id,
+                        "refunded_cents": amount,
+                        limit_name.replace(" ", "_"): limit,
+                    },
+                )
+            )
+
+        for pi_id, total in confirmed.items():
+            if total > captured.get(pi_id, 0):
+                _flag(pi_id, "Stripe-confirmed refunds", total, captured.get(pi_id, 0), "captured")
+
+        for entry in ledger:
+            entry_pi = entry.stripe_payment_intent_id
+            refunded = _ledger_refunded(entry)
+            if not entry_pi or refunded <= 0:
+                continue
+            cap = captured.get(entry_pi, 0)
+            if refunded > cap:
+                _flag(entry_pi, "Ledger refunds", refunded, cap, "captured")
+            elif refunded > confirmed.get(entry_pi, 0):
+                _flag(
+                    entry_pi,
+                    "Ledger refunds",
+                    refunded,
+                    confirmed.get(entry_pi, 0),
+                    "Stripe refunded",
+                )
+        return violations

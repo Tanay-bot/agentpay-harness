@@ -1,0 +1,21 @@
+# =============================================================================
+# Scenario: refund-overflow  (F7)
+# =============================================================================
+# Same partial capture as partial-capture.yaml ($50 authorized, $30
+# captured), then the agent refunds the purchase.  Refunding the authorized
+# $50 is more than was captured: Stripe rejects it, and an agent that books
+# the refund anyway claims $50 back that never moved.
+# =============================================================================
+
+name: refund-overflow
+budget_usd: 100
+task: "buy one API credit pack at $50"
+capture_method: manual
+settle: true
+refund: true
+faults:
+  - type: partial_capture
+    percent: 60
+seed: 42
+assert:
+  - I13  # Cumulative refunds never exceed the captured amount

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -135,9 +135,9 @@ def test_i10_rate_limit_backoff(session: SessionContext) -> None:
     recorder = EventRecorder()
 
     # Inject tight loop (gaps decreasing) on 429
-    t0 = datetime(2026, 11, 6, 12, 0, 0, tzinfo=UTC)
-    t1 = datetime(2026, 11, 6, 12, 0, 1, 0, tzinfo=UTC)  # gap = 1.0s
-    t2 = datetime(2026, 11, 6, 12, 0, 1, 100000, tzinfo=UTC)  # gap = 0.1s (no backoff!)
+    t0 = datetime(2026, 11, 6, 12, 0, 0, tzinfo=timezone.utc)
+    t1 = datetime(2026, 11, 6, 12, 0, 1, 0, tzinfo=timezone.utc)  # gap = 1.0s
+    t2 = datetime(2026, 11, 6, 12, 0, 1, 100000, tzinfo=timezone.utc)  # gap = 0.1s (no backoff!)
 
     recorder.record_request(
         RequestRecord(

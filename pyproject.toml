@@ -4,11 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentpay-harness"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fault-injection test harness for AI-agent-initiated Stripe payments"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [{ name = "agentpay-harness contributors" }]
 keywords = ["stripe", "testing", "fault-injection", "ai-agent", "payments"]
 classifiers = [
@@ -16,6 +16,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -28,35 +29,37 @@ dependencies = [
     "click>=8.1",
     "pyyaml>=6.0",
     "rich>=13.0",
-    "httpx>=0.27",
-    "pydantic>=2.5",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
     "pytest-cov>=4.1",
     "ruff>=0.4",
     "mypy>=1.10",
     "types-PyYAML>=6.0",
-    "types-stripe>=3.5",
 ]
+
+[tool.hatch.version]
+path = "agentpay_harness/__init__.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["agentpay_harness", "scenarios", "docs", "tests", "README.md", "LICENSE"]
 
 [project.scripts]
 agentpay = "agentpay_harness.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/agentpay-harness/agentpay-harness"
-Documentation = "https://github.com/agentpay-harness/agentpay-harness#readme"
-Repository = "https://github.com/agentpay-harness/agentpay-harness"
-Issues = "https://github.com/agentpay-harness/agentpay-harness/issues"
+Homepage = "https://github.com/Tanay-bot/agentpay-harness"
+Documentation = "https://github.com/Tanay-bot/agentpay-harness#readme"
+Repository = "https://github.com/Tanay-bot/agentpay-harness"
+Issues = "https://github.com/Tanay-bot/agentpay-harness/issues"
 
 # ---------------------------------------------------------------------------
 # Ruff
 # ---------------------------------------------------------------------------
 [tool.ruff]
-target-version = "py311"
+target-version = "py310"
 line-length = 100
 
 [tool.ruff.lint]
@@ -80,6 +83,9 @@ ignore = [
     "SIM102",  # nested ifs kept where each condition carries its own explanatory comment
 ]
 
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]  # test-only secrets
+
 [tool.ruff.lint.isort]
 known-first-party = ["agentpay_harness"]
 
@@ -87,7 +93,7 @@ known-first-party = ["agentpay_harness"]
 # mypy
 # ---------------------------------------------------------------------------
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.10"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
@@ -109,8 +115,8 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "slow: marks tests that hit stripe-mock and may take >1s",
-    "integration: marks tests requiring a live stripe-mock process",
+    "slow: marks tests that may take >1s",
+    "integration: needs a Stripe test key and/or the Stripe CLI; skipped in CI",
 ]
 addopts = [
     "--strict-markers",

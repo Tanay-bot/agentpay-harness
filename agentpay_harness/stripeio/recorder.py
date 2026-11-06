@@ -10,8 +10,8 @@ import json
 import re
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime
-from typing import Literal
+from datetime import datetime, timezone
+from typing import Any, Literal
 
 from agentpay_harness.types import RequestRecord, StripeEvent
 
@@ -185,13 +185,13 @@ class EventRecorder:
     def from_json(cls, data: str) -> EventRecorder:
         """Deserialize a JSON timeline into a new :class:`EventRecorder`."""
         recorder = cls()
-        entries: list[dict[str, object]] = json.loads(data)
+        entries: list[dict[str, Any]] = json.loads(data)
         for item in entries:
             entry_type = item.get("entry_type")
             if entry_type == "request" and "request" in item:
-                recorder.record_request(_deserialize_request(item["request"]))  # type: ignore[arg-type]
+                recorder.record_request(_deserialize_request(item["request"]))
             elif entry_type == "event" and "event" in item:
-                recorder.record_event(_deserialize_event(item["event"]))  # type: ignore[arg-type]
+                recorder.record_event(_deserialize_event(item["event"]))
         return recorder
 
     # ------------------------------------------------------------------
@@ -208,59 +208,60 @@ class EventRecorder:
 # ======================================================================
 
 
-def _serialize_request(record: RequestRecord) -> dict[str, object]:
+def _serialize_request(record: RequestRecord) -> dict[str, Any]:
     """Convert a ``RequestRecord`` to a JSON-safe dict."""
     return {
-        "id": record.id,
+        "record_id": record.record_id,
         "timestamp": record.timestamp.isoformat(),
         "method": record.method,
         "path": record.path,
-        "request_body": record.request_body,
-        "status_code": record.status_code,
+        "body": record.body,
+        "headers": record.headers,
+        "idempotency_key": record.idempotency_key,
+        "response_status": record.response_status,
         "response_body": record.response_body,
-        "error": record.error,
         "response_time_ms": record.response_time_ms,
+        "fault_injected": record.fault_injected,
     }
 
 
-def _deserialize_request(raw: dict[str, object]) -> RequestRecord:
+def _deserialize_request(raw: dict[str, Any]) -> RequestRecord:
     """Reconstruct a ``RequestRecord`` from a serialized dict."""
     ts = raw.get("timestamp")
-    timestamp = datetime.fromisoformat(str(ts)) if ts else datetime.now(tz=UTC)
     return RequestRecord(
-        id=str(raw.get("id", "")),
-        timestamp=timestamp,
+        record_id=str(raw.get("record_id", "")),
+        timestamp=datetime.fromisoformat(str(ts)) if ts else datetime.now(tz=timezone.utc),
         method=str(raw.get("method", "")),
         path=str(raw.get("path", "")),
-        request_body=raw.get("request_body") or {},  # type: ignore[arg-type]
-        status_code=int(raw.get("status_code", 0)),  # type: ignore[arg-type]
-        response_body=raw.get("response_body") or {},  # type: ignore[arg-type]
-        error=str(raw["error"]) if raw.get("error") else None,
-        response_time_ms=float(raw.get("response_time_ms", 0.0)),  # type: ignore[arg-type]
+        body=raw.get("body"),
+        headers=dict(raw.get("headers") or {}),
+        idempotency_key=raw.get("idempotency_key"),
+        response_status=raw.get("response_status"),
+        response_body=raw.get("response_body"),
+        response_time_ms=raw.get("response_time_ms"),
+        fault_injected=raw.get("fault_injected"),
     )
 
 
-def _serialize_event(event: StripeEvent) -> dict[str, object]:
-    """Convert a ``StripeEvent`` to a JSON-safe dict."""
+def _serialize_event(event: StripeEvent) -> dict[str, Any]:
+    """Convert a ``StripeEvent`` to a JSON-safe dict (payload/signature are not kept)."""
     return {
-        "id": event.id,
-        "timestamp": event.timestamp.isoformat(),
-        "event_type": event.event_type,
+        "event_id": event.event_id,
+        "type": event.type,
+        "created": event.created,
         "data": event.data,
         "api_version": event.api_version,
         "livemode": event.livemode,
     }
 
 
-def _deserialize_event(raw: dict[str, object]) -> StripeEvent:
+def _deserialize_event(raw: dict[str, Any]) -> StripeEvent:
     """Reconstruct a ``StripeEvent`` from a serialized dict."""
-    ts = raw.get("timestamp")
-    timestamp = datetime.fromisoformat(str(ts)) if ts else datetime.now(tz=UTC)
     return StripeEvent(
-        id=str(raw.get("id", "")),
-        timestamp=timestamp,
-        event_type=str(raw.get("event_type", "")),
-        data=raw.get("data") or {},  # type: ignore[arg-type]
-        api_version=str(raw.get("api_version", "")) or None,
+        event_id=str(raw.get("event_id", "")),
+        type=str(raw.get("type", "")),
+        data=dict(raw.get("data") or {}),
+        created=int(raw.get("created", 0)),
+        api_version=raw.get("api_version"),
         livemode=bool(raw.get("livemode", False)),
     )

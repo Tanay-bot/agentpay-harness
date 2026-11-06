@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Ruff (format)
+        run: ruff format --check .
+
+      - name: Mypy (strict)
+        run: mypy agentpay_harness/
+
+      # No Stripe key in CI: tests that need one are marked `integration` and skipped.
+      # Coverage below 80% fails the build (fail_under in pyproject.toml).
+      - name: Pytest with coverage
+        run: pytest -m "not integration" --cov=agentpay_harness --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  package:
+    name: Build & smoke-test package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Install wheel into a clean venv and run the CLI
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/smoke/bin/agentpay --help
+          /tmp/smoke/bin/agentpay --version
+
+  integration:
+    # Real Stripe test mode via the Stripe CLI.  Manual only, and only when the
+    # repository has a STRIPE_TEST_SECRET_KEY secret (an sk_test_ key).
+    name: Integration (Stripe CLI)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      STRIPE_TEST_SECRET_KEY: ${{ secrets.STRIPE_TEST_SECRET_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install harness
+        run: pip install -e ".[dev]"
+
+      - name: Install Stripe CLI
+        run: |
+          curl -fsSL https://github.com/stripe/stripe-cli/releases/download/v1.55.8/stripe_1.55.8_linux_x86_64.tar.gz \
+            | tar -xz -C /usr/local/bin stripe
+          stripe version
+
+      - name: Run integration tests
+        run: |
+          if [ -z "$STRIPE_TEST_SECRET_KEY" ]; then
+            echo "::error::Add a STRIPE_TEST_SECRET_KEY (sk_test_...) repository secret to run this job."
+            exit 1
+          fi
+          pytest -m integration -v
